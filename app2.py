@@ -2,7 +2,7 @@ import streamlit as st
 import paho.mqtt.client as mqtt
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -11,868 +11,889 @@ import joblib
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
 import pickle
 import os
 from collections import deque
 import warnings
+import ssl
+import threading
 warnings.filterwarnings('ignore')
 
-# =============== SISTEM KOMPLIT ML IoT ===============
+# =============== KONFIGURASI HIVEMQ REAL ANDA ===============
+MQTT_CONFIG = {
+    "host": "f44c5a09b28447449642c2c62b63bba7.s1.eu.hivemq.cloud",
+    "port": 8883,
+    "username": "hivemq.webclient.1764923408610",
+    "password": "9y&f74G1*pWSD.tQdXa@",
+    "use_ssl": True
+}
 
-class CompleteMLSystem:
+# Topics REAL dari perangkat IoT Anda
+PUB_TOPIC_DHT = "sic/dibimbing/kelompok-SENSOR/FARIZ/pub/dht"  # Topic tempat ESP32 mengirim data
+SUB_TOPIC_LED = "sic/dibimbing/kelompok-SENSOR/FARIZ/sub/led"   # Topic untuk kontrol LED ke ESP32
+
+# =============== INISIALISASI STATE GLOBAL ===============
+if 'sensor_live_data' not in st.session_state:
+    st.session_state.sensor_live_data = {
+        "temperature": 0.0,
+        "humidity": 0.0,
+        "timestamp": "",
+        "led_status": "off",
+        "led_mode": "manual",
+        "last_update": None,
+        "mqtt_connected": False,
+        "data_received": False
+    }
+
+if 'history' not in st.session_state:
+    st.session_state.history = {
+        "timestamps": deque(maxlen=100),
+        "temperatures": deque(maxlen=100),
+        "humidities": deque(maxlen=100),
+        "led_commands": deque(maxlen=50),
+        "predictions": deque(maxlen=50)
+    }
+
+if 'ml_system' not in st.session_state:
+    st.session_state.ml_system = None
+
+if 'mqtt_client' not in st.session_state:
+    st.session_state.mqtt_client = None
+
+# =============== SISTEM MACHINE LEARNING REAL ===============
+class RealMLSystem:
     def __init__(self):
         self.model = None
         self.scaler = StandardScaler()
         self.label_encoder = LabelEncoder()
         self.dataset = []
-        self.history_size = 1000
+        self.is_trained = False
+        self.load_or_init_model()
+    
+    def load_or_init_model(self):
+        """Load model yang sudah ada atau buat model baru"""
+        try:
+            if os.path.exists('real_iot_model.pkl'):
+                with open('real_iot_model.pkl', 'rb') as f:
+                    model_data = pickle.load(f)
+                self.model = model_data['model']
+                self.scaler = model_data['scaler']
+                self.label_encoder = model_data['label_encoder']
+                self.is_trained = True
+                print("✅ Model loaded from file")
+            else:
+                self.create_initial_model()
+        except:
+            self.create_initial_model()
+    
+    def create_initial_model(self):
+        """Buat model awal berdasarkan aturan suhu"""
+        print("🔄 Creating initial model...")
         
-        # Inisialisasi dataset
-        self.load_or_create_dataset()
+        # Generate training data berdasarkan aturan fisik
+        # Dingin (<25°C) -> Biru
+        # Normal (25-28°C) -> Hijau
+        # Panas (>28°C) -> Merah
         
-    # =============== 1. DATA COLLECTION ===============
-    def collect_data(self, temperature, humidity, led_color, 
-                    user_feedback=None, is_correct_prediction=True):
-        """Kumpulkan data dari sensor dan interaksi user"""
+        np.random.seed(42)
+        n_samples = 300
         
-        data_point = {
+        temperatures = []
+        humidities = []
+        labels = []
+        
+        # Data untuk kondisi dingin
+        for _ in range(n_samples // 3):
+            temp = np.random.uniform(15, 25)
+            hum = np.random.uniform(40, 80)
+            temperatures.append(temp)
+            humidities.append(hum)
+            labels.append('biru')
+        
+        # Data untuk kondisi normal
+        for _ in range(n_samples // 3):
+            temp = np.random.uniform(25, 28)
+            hum = np.random.uniform(40, 80)
+            temperatures.append(temp)
+            humidities.append(hum)
+            labels.append('hijau')
+        
+        # Data untuk kondisi panas
+        for _ in range(n_samples // 3):
+            temp = np.random.uniform(28, 35)
+            hum = np.random.uniform(30, 70)
+            temperatures.append(temp)
+            humidities.append(hum)
+            labels.append('merah')
+        
+        X = np.column_stack([temperatures, humidities])
+        y = np.array(labels)
+        
+        # Encode labels
+        y_encoded = self.label_encoder.fit_transform(y)
+        
+        # Scale features
+        X_scaled = self.scaler.fit_transform(X)
+        
+        # Train Random Forest
+        self.model = RandomForestClassifier(
+            n_estimators=50,
+            max_depth=5,
+            random_state=42
+        )
+        
+        self.model.fit(X_scaled, y_encoded)
+        self.is_trained = True
+        
+        # Save initial model
+        self.save_model()
+        print("✅ Initial model created and saved")
+    
+    def predict(self, temperature, humidity):
+        """Prediksi warna LED berdasarkan data sensor"""
+        if not self.is_trained:
+            # Fallback ke aturan sederhana jika model belum ada
+            if temperature < 25:
+                return 'biru', 0.9
+            elif temperature > 28:
+                return 'merah', 0.9
+            else:
+                return 'hijau', 0.9
+        
+        try:
+            # Prepare input
+            X = np.array([[temperature, humidity]])
+            X_scaled = self.scaler.transform(X)
+            
+            # Predict
+            prediction_encoded = self.model.predict(X_scaled)[0]
+            probabilities = self.model.predict_proba(X_scaled)[0]
+            
+            # Get confidence
+            confidence = np.max(probabilities)
+            
+            # Decode prediction
+            led_color = self.label_encoder.inverse_transform([prediction_encoded])[0]
+            
+            return led_color, confidence
+            
+        except Exception as e:
+            print(f"❌ Prediction error: {e}")
+            # Fallback
+            if temperature < 25:
+                return 'biru', 0.8
+            elif temperature > 28:
+                return 'merah', 0.8
+            else:
+                return 'hijau', 0.8
+    
+    def add_training_data(self, temperature, humidity, led_color, is_correct=True):
+        """Tambahkan data training baru dari penggunaan real"""
+        self.dataset.append({
             'timestamp': datetime.now(),
             'temperature': temperature,
             'humidity': humidity,
             'led_color': led_color,
-            'user_feedback': user_feedback,
-            'is_correct': is_correct_prediction,
-            'source': 'sensor_live'
-        }
+            'is_correct': is_correct
+        })
         
-        self.dataset.append(data_point)
-        
-        # Auto-save setiap 10 data points
+        # Auto-save dataset
         if len(self.dataset) % 10 == 0:
             self.save_dataset()
-            
-        return len(self.dataset)
     
-    def load_or_create_dataset(self):
-        """Load dataset existing atau buat baru"""
-        try:
-            if os.path.exists('iot_dataset.csv'):
-                df = pd.read_csv('iot_dataset.csv')
-                self.dataset = df.to_dict('records')
-                st.success(f"📂 Dataset loaded: {len(self.dataset)} records")
-            else:
-                # Create initial dataset dengan data dummy
-                self.create_initial_dataset()
-                st.info("📝 Initial dataset created")
-        except:
-            self.create_initial_dataset()
-    
-    def create_initial_dataset(self):
-        """Buat dataset awal untuk training"""
-        np.random.seed(42)
-        
-        # Generate synthetic data
-        n_samples = 200
-        
-        for i in range(n_samples):
-            temp = np.random.uniform(15, 35)
-            hum = np.random.uniform(40, 90)
-            
-            # Rules based on temperature
-            if temp < 22:
-                led = 'biru'  # dingin
-            elif temp < 28:
-                led = 'hijau'  # normal
-            else:
-                led = 'merah'  # panas
-            
-            # 10% noise
-            if np.random.random() < 0.1:
-                led = np.random.choice(['merah', 'hijau', 'kuning', 'biru'])
-            
-            self.dataset.append({
-                'timestamp': datetime.now(),
-                'temperature': temp,
-                'humidity': hum,
-                'led_color': led,
-                'user_feedback': None,
-                'is_correct': True,
-                'source': 'synthetic'
-            })
-        
-        self.save_dataset()
-    
-    # =============== 2. DATA CLEANING ===============
-    def clean_data(self):
-        """Cleaning dan preprocessing data"""
-        if len(self.dataset) == 0:
-            return None
-        
-        df = pd.DataFrame(self.dataset)
-        
-        # Cleaning steps
-        st.write("🧹 **Data Cleaning Process:**")
-        
-        # 1. Remove duplicates
-        initial_len = len(df)
-        df = df.drop_duplicates()
-        st.write(f"  - Removed {initial_len - len(df)} duplicates")
-        
-        # 2. Handle missing values
-        missing_before = df.isnull().sum().sum()
-        df = df.dropna()
-        st.write(f"  - Removed {missing_before} missing values")
-        
-        # 3. Remove outliers (IQR method)
-        Q1 = df['temperature'].quantile(0.25)
-        Q3 = df['temperature'].quantile(0.75)
-        IQR = Q3 - Q1
-        outlier_mask = (df['temperature'] < (Q1 - 1.5 * IQR)) | \
-                      (df['temperature'] > (Q3 + 1.5 * IQR))
-        outliers = outlier_mask.sum()
-        df = df[~outlier_mask]
-        st.write(f"  - Removed {outliers} temperature outliers")
-        
-        # 4. Cap extreme values
-        df['temperature'] = df['temperature'].clip(10, 40)
-        df['humidity'] = df['humidity'].clip(20, 100)
-        
-        st.success(f"✅ Cleaning complete. Final dataset: {len(df)} records")
-        
-        return df
-    
-    # =============== 3. FEATURE ENGINEERING ===============
-    def engineer_features(self, df):
-        """Feature engineering untuk meningkatkan model"""
-        
-        # Basic features
-        df['temp_hum_ratio'] = df['temperature'] / (df['humidity'] + 0.01)
-        df['comfort_index'] = 0.8 * df['temperature'] - 0.5 * df['humidity'] + 0.3 * (100 - df['humidity'])
-        
-        # Time-based features (jika ada timestamp)
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df['hour'] = df['timestamp'].dt.hour
-            df['is_daytime'] = df['hour'].apply(lambda x: 1 if 6 <= x <= 18 else 0)
-        
-        # Statistical features
-        df['temp_rolling_mean'] = df['temperature'].rolling(window=5, min_periods=1).mean()
-        df['humidity_change'] = df['humidity'].diff().fillna(0)
-        
-        # Interaction features
-        df['temp_hum_interaction'] = df['temperature'] * df['humidity'] / 100
-        
-        # Categorical encoding untuk LED color
-        if 'led_color' in df.columns:
-            df['led_encoded'] = self.label_encoder.fit_transform(df['led_color'])
-        
-        # Select final features
-        feature_cols = [
-            'temperature', 'humidity', 'temp_hum_ratio', 
-            'comfort_index', 'temp_hum_interaction'
-        ]
-        
-        # Hapus kolom dengan NaN
-        df = df.dropna(subset=feature_cols)
-        
-        return df, feature_cols
-    
-    # =============== 4. MODEL TRAINING ===============
-    def train_model(self, test_size=0.2):
-        """Train model dengan dataset yang ada"""
-        if len(self.dataset) < 50:
-            st.warning("⚠️ Need at least 50 samples for training")
-            return None
-        
-        # 1. Clean data
-        df = self.clean_data()
-        if df is None:
-            return None
-        
-        # 2. Feature engineering
-        df, feature_cols = self.engineer_features(df)
-        
-        # 3. Prepare X and y
-        X = df[feature_cols].values
-        y = df['led_encoded'].values
-        
-        # 4. Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=42, stratify=y
-        )
-        
-        # 5. Scale features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
-        
-        # 6. Train model
-        self.model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            min_samples_split=5,
-            min_samples_leaf=2,
-            random_state=42,
-            class_weight='balanced'
-        )
-        
-        self.model.fit(X_train_scaled, y_train)
-        
-        # 7. Evaluate
-        train_score = self.model.score(X_train_scaled, y_train)
-        test_score = self.model.score(X_test_scaled, y_test)
-        
-        # 8. Detailed evaluation
-        y_pred = self.model.predict(X_test_scaled)
-        report = classification_report(y_test, y_pred, 
-                                     target_names=self.label_encoder.classes_)
-        
-        # Confusion matrix
-        cm = confusion_matrix(y_test, y_pred)
-        
-        results = {
-            'train_accuracy': train_score,
-            'test_accuracy': test_score,
-            'classification_report': report,
-            'confusion_matrix': cm,
-            'feature_importance': dict(zip(feature_cols, 
-                                         self.model.feature_importances_)),
-            'model': self.model,
-            'X_test': X_test,
-            'y_test': y_test,
-            'y_pred': y_pred
-        }
-        
-        st.success(f"✅ Model trained! Train Acc: {train_score:.2%}, Test Acc: {test_score:.2%}")
-        
-        return results
-    
-    # =============== 5. LIVE PREDICTION ===============
-    def predict_live(self, temperature, humidity):
-        """Prediksi real-time dari sensor input"""
-        if self.model is None:
-            # Default prediction jika model belum ada
-            if temperature < 22:
-                return 'biru', 0.8
-            elif temperature < 28:
-                return 'hijau', 0.8
-            else:
-                return 'merah', 0.8
-        
-        # Prepare features
-        features = np.array([[temperature, humidity]])
-        
-        # Apply same feature engineering
-        temp_hum_ratio = temperature / (humidity + 0.01)
-        comfort_index = 0.8 * temperature - 0.5 * humidity + 0.3 * (100 - humidity)
-        temp_hum_interaction = temperature * humidity / 100
-        
-        X = np.array([[temperature, humidity, temp_hum_ratio, 
-                      comfort_index, temp_hum_interaction]])
-        
-        # Scale
-        X_scaled = self.scaler.transform(X)
-        
-        # Predict
-        prediction = self.model.predict(X_scaled)[0]
-        probabilities = self.model.predict_proba(X_scaled)[0]
-        
-        # Get confidence
-        confidence = np.max(probabilities)
-        
-        # Decode prediction
-        led_color = self.label_encoder.inverse_transform([prediction])[0]
-        
-        return led_color, confidence
-    
-    # =============== 6. MODEL EVALUATION DASHBOARD ===============
-    def create_evaluation_dashboard(self, results):
-        """Buat dashboard evaluasi model"""
-        
-        if results is None:
-            st.warning("No evaluation results available")
-            return
-        
-        st.subheader("📊 Model Evaluation Dashboard")
-        
-        # Metrics
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Train Accuracy", f"{results['train_accuracy']:.2%}")
-        with col2:
-            st.metric("Test Accuracy", f"{results['test_accuracy']:.2%}")
-        with col3:
-            st.metric("Overfitting", 
-                     f"{(results['train_accuracy'] - results['test_accuracy']):.2%}")
-        
-        # Classification Report
-        st.subheader("📈 Classification Report")
-        st.text(results['classification_report'])
-        
-        # Confusion Matrix
-        st.subheader("🎯 Confusion Matrix")
-        fig, ax = plt.subplots(figsize=(8, 6))
-        sns.heatmap(results['confusion_matrix'], 
-                   annot=True, fmt='d', cmap='Blues',
-                   xticklabels=self.label_encoder.classes_,
-                   yticklabels=self.label_encoder.classes_)
-        plt.xlabel('Predicted')
-        plt.ylabel('Actual')
-        st.pyplot(fig)
-        
-        # Feature Importance
-        st.subheader("🏆 Feature Importance")
-        importance_df = pd.DataFrame({
-            'Feature': list(results['feature_importance'].keys()),
-            'Importance': list(results['feature_importance'].values())
-        }).sort_values('Importance', ascending=False)
-        
-        fig2 = go.Figure(go.Bar(
-            x=importance_df['Importance'],
-            y=importance_df['Feature'],
-            orientation='h',
-            marker_color='lightblue'
-        ))
-        fig2.update_layout(title="Feature Importance", height=400)
-        st.plotly_chart(fig2, use_container_width=True)
-        
-        # Prediction Distribution
-        st.subheader("📊 Prediction Distribution")
-        pred_counts = pd.Series(results['y_pred']).value_counts().sort_index()
-        fig3 = go.Figure(go.Pie(
-            labels=self.label_encoder.inverse_transform(pred_counts.index),
-            values=pred_counts.values,
-            hole=.3
-        ))
-        fig3.update_layout(title="Test Set Predictions")
-        st.plotly_chart(fig3, use_container_width=True)
-    
-    # =============== 7. EDGE IMPULSE EXPORT ===============
-    def export_to_edge_impulse(self):
-        """Export model ke format Edge Impulse"""
-        
-        if self.model is None:
-            st.warning("Model not trained yet")
-            return False
+    def retrain_model(self):
+        """Retrain model dengan data baru"""
+        if len(self.dataset) < 10:
+            return False, "Butuh minimal 10 data untuk training"
         
         try:
-            # Convert to TensorFlow Lite (via ONNX atau langsung)
-            import tensorflow as tf
+            # Convert to arrays
+            temperatures = [d['temperature'] for d in self.dataset]
+            humidities = [d['humidity'] for d in self.dataset]
+            labels = [d['led_color'] for d in self.dataset]
             
-            # Simpan model scikit-learn
-            with open('edge_model.pkl', 'wb') as f:
-                pickle.dump({
-                    'model': self.model,
-                    'scaler': self.scaler,
-                    'label_encoder': self.label_encoder
-                }, f)
+            X = np.column_stack([temperatures, humidities])
+            y = self.label_encoder.fit_transform(labels)
             
-            # Buat metadata untuk Edge Impulse
-            metadata = {
-                "model": {
-                    "type": "sklearn",
-                    "version": "1.0",
-                    "classes": self.label_encoder.classes_.tolist(),
-                    "input_features": ["temperature", "humidity"],
-                    "output_type": "classification",
-                    "sample_rate": 1
-                },
-                "sensor": "DHT11",
-                "parameters": {
-                    "temperature_range": [10, 40],
-                    "humidity_range": [20, 100]
-                }
-            }
+            # Scale
+            X_scaled = self.scaler.fit_transform(X)
             
-            with open('edge_metadata.json', 'w') as f:
-                json.dump(metadata, f, indent=2)
+            # Train new model
+            self.model = RandomForestClassifier(
+                n_estimators=100,
+                max_depth=10,
+                random_state=42
+            )
             
-            # Buat C++ code untuk deployment
-            cpp_code = """
-// Edge Impulse C++ implementation
-#include <cmath>
-#include <vector>
-
-class IoTClassifier {
-public:
-    std::string predict(float temperature, float humidity) {
-        // Simplified decision tree from model
-        if (temperature < 22.0) {
-            return "biru";
-        } else if (temperature < 28.0) {
-            return "hijau";
-        } else {
-            return "merah";
-        }
-    }
-};
-            """
+            self.model.fit(X_scaled, y)
+            self.is_trained = True
             
-            with open('edge_classifier.cpp', 'w') as f:
-                f.write(cpp_code)
+            # Save updated model
+            self.save_model()
             
-            st.success("✅ Edge Impulse files exported:")
-            st.code("""
-Exported files:
-- edge_model.pkl (Machine Learning model)
-- edge_metadata.json (Model metadata)
-- edge_classifier.cpp (C++ implementation)
-            
-Upload these to Edge Impulse Studio for deployment!
-            """)
-            
-            return True
+            return True, f"Model retrained with {len(self.dataset)} samples"
             
         except Exception as e:
-            st.error(f"❌ Export failed: {e}")
-            return False
+            return False, f"Training failed: {str(e)}"
     
-    # =============== 8. UTILITY FUNCTIONS ===============
-    def save_dataset(self, filename='iot_dataset.csv'):
-        """Save dataset to CSV"""
-        if len(self.dataset) > 0:
-            df = pd.DataFrame(self.dataset)
-            df.to_csv(filename, index=False)
-            return True
-        return False
-    
-    def save_model(self, filename='iot_model.pkl'):
-        """Save complete model pipeline"""
+    def save_model(self):
+        """Save model ke file"""
         model_data = {
             'model': self.model,
             'scaler': self.scaler,
             'label_encoder': self.label_encoder,
-            'dataset_size': len(self.dataset)
+            'dataset': self.dataset,
+            'trained_at': datetime.now()
         }
-        with open(filename, 'wb') as f:
+        
+        with open('real_iot_model.pkl', 'wb') as f:
             pickle.dump(model_data, f)
-        return True
     
-    def load_model(self, filename='iot_model.pkl'):
-        """Load model pipeline"""
-        if os.path.exists(filename):
-            with open(filename, 'rb') as f:
-                model_data = pickle.load(f)
-            self.model = model_data['model']
-            self.scaler = model_data['scaler']
-            self.label_encoder = model_data['label_encoder']
-            return True
+    def save_dataset(self):
+        """Save dataset ke CSV"""
+        if self.dataset:
+            df = pd.DataFrame(self.dataset)
+            df.to_csv('real_iot_dataset.csv', index=False)
+
+# =============== FUNGSI MQTT REAL ===============
+def on_mqtt_connect(client, userdata, flags, rc, properties=None):
+    """Callback ketika terhubung ke HiveMQ"""
+    if rc == 0:
+        st.session_state.sensor_live_data["mqtt_connected"] = True
+        print(f"✅ Connected to HiveMQ Cloud!")
+        print(f"📡 Subscribing to: {PUB_TOPIC_DHT}")
+        
+        # Subscribe ke topic sensor
+        client.subscribe(PUB_TOPIC_DHT)
+        
+    else:
+        st.session_state.sensor_live_data["mqtt_connected"] = False
+        print(f"❌ Connection failed with code: {rc}")
+
+def on_mqtt_disconnect(client, userdata, rc, properties=None):
+    """Callback ketika terputus dari MQTT"""
+    st.session_state.sensor_live_data["mqtt_connected"] = False
+    print(f"⚠️ Disconnected from MQTT")
+
+def on_mqtt_message(client, userdata, msg):
+    """Callback ketika menerima data dari perangkat IoT REAL"""
+    try:
+        # Decode message
+        payload = msg.payload.decode('utf-8')
+        data = json.loads(payload)
+        
+        print(f"📨 Received REAL data from {msg.topic}: {data}")
+        
+        # Update sensor data
+        temperature = float(data.get('temperature', 0))
+        humidity = float(data.get('humidity', 0))
+        
+        st.session_state.sensor_live_data.update({
+            "temperature": temperature,
+            "humidity": humidity,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "last_update": datetime.now(),
+            "data_received": True
+        })
+        
+        # Add to history
+        st.session_state.history["timestamps"].append(
+            datetime.now().strftime("%H:%M:%S")
+        )
+        st.session_state.history["temperatures"].append(temperature)
+        st.session_state.history["humidities"].append(humidity)
+        
+        # Jika mode AI aktif, lakukan prediksi dan kontrol
+        if st.session_state.sensor_live_data["led_mode"] == "ai":
+            if st.session_state.ml_system and st.session_state.ml_system.is_trained:
+                led_color, confidence = st.session_state.ml_system.predict(
+                    temperature, humidity
+                )
+                
+                # Update display
+                st.session_state.sensor_live_data["led_status"] = led_color
+                
+                # Kirim perintah ke device jika berbeda dengan status sebelumnya
+                current_led = st.session_state.sensor_live_data.get("led_status", "off")
+                if led_color != current_led:
+                    send_led_command(led_color)
+                
+                # Simpan prediksi
+                st.session_state.history["predictions"].append({
+                    "timestamp": datetime.now(),
+                    "temperature": temperature,
+                    "humidity": humidity,
+                    "predicted_led": led_color,
+                    "confidence": confidence
+                })
+        
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON decode error: {e}")
+        print(f"Raw payload: {msg.payload}")
+    except Exception as e:
+        print(f"❌ Error processing MQTT message: {e}")
+
+def connect_to_hivemq():
+    """Connect ke HiveMQ Cloud"""
+    try:
+        # Create MQTT client
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        client.username_pw_set(MQTT_CONFIG["username"], MQTT_CONFIG["password"])
+        
+        # Setup SSL/TLS
+        if MQTT_CONFIG["use_ssl"]:
+            client.tls_set(tls_version=ssl.PROTOCOL_TLS)
+        
+        # Set callbacks
+        client.on_connect = on_mqtt_connect
+        client.on_disconnect = on_mqtt_disconnect
+        client.on_message = on_mqtt_message
+        
+        # Connect
+        client.connect(MQTT_CONFIG["host"], MQTT_CONFIG["port"], 60)
+        
+        # Start loop in background
+        client.loop_start()
+        
+        # Tunggu koneksi
+        time.sleep(3)
+        
+        # Simpan client di session state
+        st.session_state.mqtt_client = client
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Failed to connect to HiveMQ: {str(e)}")
         return False
 
-# =============== STREAMLIT DASHBOARD ===============
+def disconnect_from_hivemq():
+    """Disconnect dari HiveMQ"""
+    if st.session_state.mqtt_client:
+        try:
+            st.session_state.mqtt_client.loop_stop()
+            st.session_state.mqtt_client.disconnect()
+            st.session_state.sensor_live_data["mqtt_connected"] = False
+            print("🔌 Disconnected from HiveMQ")
+            return True
+        except:
+            return False
+    return False
 
+def send_led_command(command):
+    """Kirim perintah ke perangkat IoT REAL"""
+    if not st.session_state.mqtt_client:
+        st.warning("⚠️ MQTT not connected")
+        return False
+    
+    if not st.session_state.sensor_live_data["mqtt_connected"]:
+        st.warning("⚠️ Not connected to HiveMQ")
+        return False
+    
+    try:
+        # Kirim perintah ke ESP32
+        st.session_state.mqtt_client.publish(SUB_TOPIC_LED, command)
+        
+        # Update status lokal
+        st.session_state.sensor_live_data["led_status"] = command
+        
+        # Simpan ke history
+        st.session_state.history["led_commands"].append({
+            "timestamp": datetime.now(),
+            "command": command,
+            "mode": st.session_state.sensor_live_data["led_mode"]
+        })
+        
+        print(f"💡 Command sent to ESP32: {command}")
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Failed to send command: {str(e)}")
+        return False
+
+# =============== FUNGSI UTAMA STREAMLIT ===============
 def main():
     st.set_page_config(
-        page_title="Complete ML IoT System",
-        page_icon="🤖",
+        page_title="IoT Dashboard REAL with HiveMQ & AI",
+        page_icon="🌡️",
         layout="wide"
     )
     
-    # Initialize system
-    if 'ml_system' not in st.session_state:
-        st.session_state.ml_system = CompleteMLSystem()
+    # Custom CSS
+    st.markdown("""
+    <style>
+    .real-time-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 20px;
+        border-radius: 10px;
+        margin-bottom: 20px;
+    }
+    .sensor-value {
+        font-size: 2.5rem;
+        font-weight: bold;
+        text-align: center;
+    }
+    .sensor-label {
+        font-size: 1rem;
+        text-align: center;
+        opacity: 0.9;
+    }
+    .status-connected {
+        color: #4CAF50;
+        font-weight: bold;
+    }
+    .status-disconnected {
+        color: #FF5722;
+        font-weight: bold;
+    }
+    .ai-active {
+        border: 3px solid #4CAF50;
+        padding: 10px;
+        border-radius: 10px;
+        background-color: #E8F5E9;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
-    if 'sensor_data' not in st.session_state:
-        st.session_state.sensor_data = {
-            'temperature': 25.0,
-            'humidity': 60.0,
-            'led_color': 'hijau',
-            'confidence': 0.0
-        }
+    # Header
+    st.markdown("""
+    <div class="real-time-card">
+        <h1 style="text-align: center; margin: 0;">🌡️ IoT REAL-TIME DASHBOARD</h1>
+        <p style="text-align: center; opacity: 0.9;">Live Data from ESP32 via HiveMQ Cloud | AI Control System</p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    # Title
-    st.title("🧠 Complete ML IoT System")
-    st.markdown("### End-to-End Machine Learning Pipeline for IoT")
-    
-    # Sidebar
+    # Sidebar - Kontrol
     with st.sidebar:
-        st.header("🎛️ Control Panel")
+        st.header("🔗 HiveMQ Connection")
         
-        # Manual input untuk testing
-        st.subheader("🔧 Manual Input (Testing)")
-        temp = st.slider("Temperature (°C)", 15.0, 35.0, 25.0)
-        hum = st.slider("Humidity (%)", 40.0, 90.0, 60.0)
-        
-        if st.button("🔍 Predict Now"):
-            led, conf = st.session_state.ml_system.predict_live(temp, hum)
-            st.session_state.sensor_data.update({
-                'temperature': temp,
-                'humidity': hum,
-                'led_color': led,
-                'confidence': conf
-            })
-            st.success(f"Predicted: {led} ({conf:.1%})")
-        
-        st.markdown("---")
-        
-        # Data Management
-        st.subheader("📊 Data Management")
-        if st.button("🔄 Collect Current Data"):
-            count = st.session_state.ml_system.collect_data(
-                st.session_state.sensor_data['temperature'],
-                st.session_state.sensor_data['humidity'],
-                st.session_state.sensor_data['led_color']
-            )
-            st.info(f"Data collected! Total: {count}")
-        
-        if st.button("🧹 Clean Dataset"):
-            df = st.session_state.ml_system.clean_data()
-            if df is not None:
-                st.success(f"Cleaned dataset: {len(df)} records")
-        
-        st.markdown("---")
-        
-        # Model Management
-        st.subheader("🤖 Model Operations")
-        
-        if st.button("🚀 Train New Model"):
-            with st.spinner("Training model..."):
-                results = st.session_state.ml_system.train_model()
-                if results:
-                    st.session_state.last_results = results
-        
-        if st.button("💾 Save Model"):
-            st.session_state.ml_system.save_model()
-            st.success("Model saved!")
-        
-        if st.button("📂 Load Model"):
-            if st.session_state.ml_system.load_model():
-                st.success("Model loaded!")
+        # Status koneksi
+        col_status1, col_status2 = st.columns(2)
+        with col_status1:
+            if st.session_state.sensor_live_data["mqtt_connected"]:
+                st.success("🟢 CONNECTED")
             else:
-                st.warning("No saved model found")
+                st.error("🔴 DISCONNECTED")
         
-        if st.button("📤 Export to Edge Impulse"):
-            st.session_state.ml_system.export_to_edge_impulse()
-    
-    # Main Dashboard Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📡 Live Dashboard", 
-        "📊 Data Analysis", 
-        "🤖 Model Training",
-        "📈 Evaluation",
-        "⚡ Edge Deployment"
-    ])
-    
-    with tab1:
-        st.header("📡 Live Sensor Dashboard")
+        with col_status2:
+            if st.session_state.sensor_live_data["data_received"]:
+                last_update = st.session_state.sensor_live_data.get("timestamp", "N/A")
+                st.caption(f"Last: {last_update}")
         
-        # Display current prediction
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("🌡️ Temperature", 
-                     f"{st.session_state.sensor_data['temperature']}°C")
-        with col2:
-            st.metric("💧 Humidity", 
-                     f"{st.session_state.sensor_data['humidity']}%")
-        with col3:
-            led_color = st.session_state.sensor_data['led_color']
-            confidence = st.session_state.sensor_data['confidence']
+        # Tombol koneksi
+        col_conn1, col_conn2 = st.columns(2)
+        with col_conn1:
+            if st.button("🔗 Connect HiveMQ", type="primary", use_container_width=True):
+                with st.spinner("Connecting to HiveMQ Cloud..."):
+                    if connect_to_hivemq():
+                        st.success("✅ Connected!")
+                        time.sleep(1)
+                        st.rerun()
+        
+        with col_conn2:
+            if st.button("🔌 Disconnect", use_container_width=True):
+                disconnect_from_hivemq()
+                st.warning("Disconnected from HiveMQ")
+                time.sleep(1)
+                st.rerun()
+        
+        st.markdown("---")
+        
+        # MODE KONTROL
+        st.header("🎛️ Control Mode")
+        
+        # Pilih mode
+        mode_options = ["manual", "auto", "ai"]
+        selected_mode = st.selectbox(
+            "Select Control Mode",
+            mode_options,
+            index=mode_options.index(st.session_state.sensor_live_data.get("led_mode", "manual"))
+        )
+        
+        if selected_mode != st.session_state.sensor_live_data["led_mode"]:
+            st.session_state.sensor_live_data["led_mode"] = selected_mode
+            st.rerun()
+        
+        st.markdown(f"**Active Mode:** `{selected_mode.upper()}`")
+        
+        # KONTROL MANUAL (hanya tampil jika mode manual)
+        if selected_mode == "manual":
+            st.subheader("🎨 Manual LED Control")
             
-            color_map = {
-                'merah': '🔴',
-                'hijau': '🟢',
-                'kuning': '🟡',
-                'biru': '🔵'
-            }
+            col_led1, col_led2 = st.columns(2)
             
-            st.metric(
-                f"{color_map.get(led_color, '💡')} LED Prediction",
-                led_color.upper(),
-                delta=f"Confidence: {confidence:.1%}"
-            )
+            with col_led1:
+                if st.button("🔴 RED", use_container_width=True):
+                    if send_led_command("merah"):
+                        st.success("Red LED activated")
+                    else:
+                        st.error("Failed to send command")
+                
+                if st.button("🟢 GREEN", use_container_width=True):
+                    if send_led_command("hijau"):
+                        st.success("Green LED activated")
+                    else:
+                        st.error("Failed to send command")
+            
+            with col_led2:
+                if st.button("🟡 YELLOW", use_container_width=True):
+                    if send_led_command("kuning"):
+                        st.success("Yellow LED activated")
+                    else:
+                        st.error("Failed to send command")
+                
+                if st.button("⚫ OFF", use_container_width=True):
+                    if send_led_command("off"):
+                        st.success("LED turned off")
+                    else:
+                        st.error("Failed to send command")
         
-        # Live prediction visualization
-        st.subheader("🎯 Live Prediction Map")
+        # AI CONTROL PANEL
+        if selected_mode == "ai":
+            st.subheader("🧠 AI Control System")
+            
+            # Initialize ML system jika belum ada
+            if st.session_state.ml_system is None:
+                st.session_state.ml_system = RealMLSystem()
+            
+            # Status model AI
+            if st.session_state.ml_system.is_trained:
+                st.success("✅ AI Model is Ready")
+                dataset_size = len(st.session_state.ml_system.dataset)
+                st.caption(f"Training data: {dataset_size} samples")
+            else:
+                st.warning("⚠️ AI Model needs training")
+            
+            # Training controls
+            st.markdown("---")
+            st.subheader("🤖 AI Training")
+            
+            if st.button("🎓 Train AI Model", use_container_width=True):
+                if st.session_state.ml_system:
+                    success, message = st.session_state.ml_system.retrain_model()
+                    if success:
+                        st.success(message)
+                    else:
+                        st.warning(message)
+            
+            # Add training data dari kondisi saat ini
+            if st.button("➕ Add Current Data as Training", use_container_width=True):
+                if st.session_state.ml_system and st.session_state.sensor_live_data["data_received"]:
+                    temp = st.session_state.sensor_live_data["temperature"]
+                    hum = st.session_state.sensor_live_data["humidity"]
+                    led = st.session_state.sensor_live_data["led_status"]
+                    
+                    st.session_state.ml_system.add_training_data(temp, hum, led)
+                    st.success(f"Added: {temp}°C, {hum}% → LED {led}")
         
-        # Create prediction grid
-        temp_range = np.linspace(15, 35, 20)
-        hum_range = np.linspace(40, 90, 20)
+        st.markdown("---")
         
-        predictions = np.zeros((len(temp_range), len(hum_range)))
+        # SYSTEM INFO
+        st.header("📡 System Info")
         
-        for i, t in enumerate(temp_range):
-            for j, h in enumerate(hum_range):
-                pred, _ = st.session_state.ml_system.predict_live(t, h)
-                # Map to number
-                mapping = {'merah': 0, 'hijau': 1, 'kuning': 2, 'biru': 3}
-                predictions[i, j] = mapping.get(pred, 1)
+        st.info(f"""
+        **HiveMQ Host:** {MQTT_CONFIG['host']}
+        **Sensor Topic:** `{PUB_TOPIC_DHT}`
+        **Control Topic:** `{SUB_TOPIC_LED}`
+        **Data Points:** {len(st.session_state.history['temperatures'])}
+        """)
+    
+    # =============== MAIN DASHBOARD ===============
+    # Row 1: REAL-TIME SENSOR DATA
+    st.subheader("📡 LIVE SENSOR DATA FROM ESP32")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        temp = st.session_state.sensor_live_data["temperature"]
+        st.markdown(f"""
+        <div style="text-align: center; padding: 20px; background: #f8f9fa; border-radius: 10px; border-left: 5px solid #FF5722;">
+            <div class="sensor-label">🌡️ TEMPERATURE</div>
+            <div class="sensor-value">{temp:.1f} °C</div>
+            <div style="font-size: 0.8rem; color: #666;">Real from DHT11</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        hum = st.session_state.sensor_live_data["humidity"]
+        st.markdown(f"""
+        <div style="text-align: center; padding: 20px; background: #f8f9fa; border-radius: 10px; border-left: 5px solid #2196F3;">
+            <div class="sensor-label">💧 HUMIDITY</div>
+            <div class="sensor-value">{hum:.1f} %</div>
+            <div style="font-size: 0.8rem; color: #666;">Real from DHT11</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col3:
+        led_status = st.session_state.sensor_live_data["led_status"].upper()
+        led_mode = st.session_state.sensor_live_data["led_mode"].upper()
         
-        # Plot heatmap
-        fig = go.Figure(data=go.Heatmap(
-            z=predictions,
-            x=hum_range,
-            y=temp_range,
-            colorscale=['#FF5722', '#4CAF50', '#FFC107', '#2196F3'],
-            colorbar=dict(
-                title="LED Color",
-                tickvals=[0, 1, 2, 3],
-                ticktext=["RED", "GREEN", "YELLOW", "BLUE"]
-            )
-        ))
+        # Color mapping
+        color_icons = {
+            'merah': '🔴',
+            'hijau': '🟢',
+            'kuning': '🟡',
+            'biru': '🔵',
+            'off': '⚫'
+        }
         
-        # Add current point
-        fig.add_trace(go.Scatter(
-            x=[st.session_state.sensor_data['humidity']],
-            y=[st.session_state.sensor_data['temperature']],
-            mode='markers',
-            marker=dict(size=20, color='white', line=dict(width=3, color='black')),
-            name='Current'
-        ))
+        icon = color_icons.get(st.session_state.sensor_live_data["led_status"].lower(), '💡')
+        
+        st.markdown(f"""
+        <div style="text-align: center; padding: 20px; background: #f8f9fa; border-radius: 10px; border-left: 5px solid #4CAF50;">
+            <div class="sensor-label">{icon} LED STATUS</div>
+            <div class="sensor-value">{led_status}</div>
+            <div style="font-size: 0.8rem; color: #666;">Mode: {led_mode}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col4:
+        if st.session_state.sensor_live_data["data_received"]:
+            time_diff = datetime.now() - st.session_state.sensor_live_data["last_update"]
+            seconds_ago = time_diff.total_seconds()
+            
+            if seconds_ago < 5:
+                status_color = "#4CAF50"
+                status_text = "LIVE"
+            elif seconds_ago < 30:
+                status_color = "#FFC107"
+                status_text = f"{int(seconds_ago)}s ago"
+            else:
+                status_color = "#FF5722"
+                status_text = "STALE"
+            
+            st.markdown(f"""
+            <div style="text-align: center; padding: 20px; background: #f8f9fa; border-radius: 10px; border-left: 5px solid {status_color};">
+                <div class="sensor-label">🕐 DATA STATUS</div>
+                <div class="sensor-value" style="color: {status_color};">{status_text}</div>
+                <div style="font-size: 0.8rem; color: #666;">Last: {st.session_state.sensor_live_data['timestamp']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="text-align: center; padding: 20px; background: #f8f9fa; border-radius: 10px; border-left: 5px solid #9E9E9E;">
+                <div class="sensor-label">🕐 DATA STATUS</div>
+                <div class="sensor-value" style="color: #9E9E9E;">WAITING</div>
+                <div style="font-size: 0.8rem; color: #666;">No data received</div>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    # Row 2: REAL-TIME CHARTS
+    st.subheader("📈 LIVE DATA TRENDS")
+    
+    if len(st.session_state.history["temperatures"]) > 1:
+        # Create subplots
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=('Temperature Trend', 'Humidity Trend'),
+            vertical_spacing=0.15
+        )
+        
+        # Temperature chart
+        fig.add_trace(
+            go.Scatter(
+                x=list(st.session_state.history["timestamps"]),
+                y=list(st.session_state.history["temperatures"]),
+                mode='lines+markers',
+                name='Temperature',
+                line=dict(color='#FF5722', width=3),
+                marker=dict(size=8, color='#FF5722')
+            ),
+            row=1, col=1
+        )
+        
+        # Add threshold lines
+        fig.add_hline(y=25, line_dash="dash", line_color="blue", 
+                     annotation_text="Cold Threshold", row=1, col=1)
+        fig.add_hline(y=28, line_dash="dash", line_color="red",
+                     annotation_text="Hot Threshold", row=1, col=1)
+        
+        # Humidity chart
+        fig.add_trace(
+            go.Scatter(
+                x=list(st.session_state.history["timestamps"]),
+                y=list(st.session_state.history["humidities"]),
+                mode='lines+markers',
+                name='Humidity',
+                line=dict(color='#2196F3', width=3),
+                marker=dict(size=8, color='#2196F3')
+            ),
+            row=2, col=1
+        )
         
         fig.update_layout(
-            title="Prediction Map (Click to predict)",
-            xaxis_title="Humidity (%)",
-            yaxis_title="Temperature (°C)",
-            height=500
+            height=500,
+            showlegend=True,
+            template="plotly_white",
+            hovermode="x unified"
         )
         
         st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("⏳ Waiting for sensor data... Connect to HiveMQ and ensure ESP32 is sending data")
     
-    with tab2:
-        st.header("📊 Dataset Analysis")
+    # Row 3: AI PREDICTION MAP (jika mode AI)
+    if st.session_state.sensor_live_data["led_mode"] == "ai" and st.session_state.ml_system:
+        st.subheader("🧠 AI PREDICTION MAP")
         
-        if len(st.session_state.ml_system.dataset) > 0:
-            df = pd.DataFrame(st.session_state.ml_system.dataset)
-            
-            # Dataset info
-            st.subheader("Dataset Overview")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Samples", len(df))
-            with col2:
-                st.metric("Temperature Range", 
-                         f"{df['temperature'].min():.1f}-{df['temperature'].max():.1f}°C")
-            with col3:
-                st.metric("Humidity Range", 
-                         f"{df['humidity'].min():.1f}-{df['humidity'].max():.1f}%")
-            with col4:
-                st.metric("Unique LED Colors", df['led_color'].nunique())
-            
-            # Data preview
-            st.subheader("Data Preview")
-            st.dataframe(df.tail(10), use_container_width=True)
-            
-            # Distribution plots
-            st.subheader("Data Distributions")
-            
-            col_dist1, col_dist2 = st.columns(2)
-            with col_dist1:
-                fig1 = go.Figure(data=[go.Histogram(x=df['temperature'], nbinsx=20)])
-                fig1.update_layout(title="Temperature Distribution")
-                st.plotly_chart(fig1, use_container_width=True)
-            
-            with col_dist2:
-                fig2 = go.Figure(data=[go.Histogram(x=df['humidity'], nbinsx=20)])
-                fig2.update_layout(title="Humidity Distribution")
-                st.plotly_chart(fig2, use_container_width=True)
-            
-            # Scatter plot
-            st.subheader("Temperature vs Humidity Scatter")
-            fig3 = go.Figure()
-            
-            colors = {'merah': 'red', 'hijau': 'green', 'kuning': 'yellow', 'biru': 'blue'}
-            
-            for led_color in df['led_color'].unique():
-                subset = df[df['led_color'] == led_color]
-                fig3.add_trace(go.Scatter(
-                    x=subset['temperature'],
-                    y=subset['humidity'],
-                    mode='markers',
-                    name=led_color,
-                    marker=dict(color=colors.get(led_color, 'gray'))
-                ))
-            
-            fig3.update_layout(
-                title="Sensor Data by LED Color",
-                xaxis_title="Temperature (°C)",
-                yaxis_title="Humidity (%)"
+        # Create prediction grid
+        temp_range = np.linspace(15, 35, 15)
+        hum_range = np.linspace(30, 90, 15)
+        
+        predictions_grid = []
+        
+        for t in temp_range:
+            row = []
+            for h in hum_range:
+                pred, _ = st.session_state.ml_system.predict(t, h)
+                # Map to numerical values
+                mapping = {'merah': 0, 'hijau': 1, 'biru': 2, 'kuning': 3, 'off': 4}
+                row.append(mapping.get(pred, 1))
+            predictions_grid.append(row)
+        
+        # Create heatmap
+        fig_map = go.Figure(data=go.Heatmap(
+            z=predictions_grid,
+            x=hum_range,
+            y=temp_range,
+            colorscale=['#FF5722', '#4CAF50', '#2196F3', '#FFC107', '#9E9E9E'],
+            colorbar=dict(
+                title="LED Color",
+                tickvals=[0, 1, 2, 3, 4],
+                ticktext=["RED", "GREEN", "BLUE", "YELLOW", "OFF"]
             )
-            st.plotly_chart(fig3, use_container_width=True)
-        else:
-            st.info("No data collected yet. Use the sidebar to collect data.")
-    
-    with tab3:
-        st.header("🤖 Model Training")
+        ))
         
-        if st.button("🔄 Train Model with Current Data", type="primary"):
-            with st.spinner("Training in progress..."):
-                results = st.session_state.ml_system.train_model()
-                if results:
-                    st.session_state.last_results = results
-                    st.success("Model training complete!")
-                    st.rerun()
+        # Add current sensor point
+        if st.session_state.sensor_live_data["data_received"]:
+            fig_map.add_trace(go.Scatter(
+                x=[st.session_state.sensor_live_data["humidity"]],
+                y=[st.session_state.sensor_live_data["temperature"]],
+                mode='markers',
+                marker=dict(
+                    size=20,
+                    color='white',
+                    line=dict(width=3, color='black')
+                ),
+                name='Current Sensor'
+            ))
         
-        if 'last_results' in st.session_state:
-            st.session_state.ml_system.create_evaluation_dashboard(
-                st.session_state.last_results
-            )
-        else:
-            st.info("Train a model to see evaluation results here.")
-    
-    with tab4:
-        st.header("📈 Model Evaluation")
+        fig_map.update_layout(
+            title="AI Decision Map (Temperature vs Humidity)",
+            xaxis_title="Humidity (%)",
+            yaxis_title="Temperature (°C)",
+            height=400
+        )
         
-        if 'last_results' in st.session_state:
-            results = st.session_state.last_results
+        st.plotly_chart(fig_map, use_container_width=True)
+        
+        # Show current prediction info
+        if st.session_state.sensor_live_data["data_received"]:
+            temp = st.session_state.sensor_live_data["temperature"]
+            hum = st.session_state.sensor_live_data["humidity"]
             
-            # Advanced metrics
-            st.subheader("Advanced Model Metrics")
+            predicted_led, confidence = st.session_state.ml_system.predict(temp, hum)
             
-            # ROC Curve (simplified)
-            from sklearn.metrics import roc_curve, auc
-            from sklearn.preprocessing import label_binarize
+            col_pred1, col_pred2 = st.columns(2)
             
-            # Binarize the output for ROC
-            y_test_bin = label_binarize(results['y_test'], 
-                                      classes=np.unique(results['y_test']))
-            
-            # Get prediction probabilities
-            y_score = st.session_state.ml_system.model.predict_proba(
-                st.session_state.ml_system.scaler.transform(results['X_test'])
-            )
-            
-            # Plot ROC for each class
-            fig_roc = go.Figure()
-            
-            for i in range(y_test_bin.shape[1]):
-                fpr, tpr, _ = roc_curve(y_test_bin[:, i], y_score[:, i])
-                roc_auc = auc(fpr, tpr)
+            with col_pred1:
+                st.info(f"""
+                **Current AI Prediction:**
                 
-                fig_roc.add_trace(go.Scatter(
-                    x=fpr, y=tpr,
-                    mode='lines',
-                    name=f'Class {st.session_state.ml_system.label_encoder.classes_[i]} (AUC={roc_auc:.2f})'
-                ))
+                🌡️ Temperature: {temp:.1f}°C
+                💧 Humidity: {hum:.1f}%
+                🎯 Predicted LED: **{predicted_led.upper()}**
+                """)
             
-            fig_roc.add_trace(go.Scatter(
-                x=[0, 1], y=[0, 1],
-                mode='lines',
-                name='Random',
-                line=dict(dash='dash', color='gray')
-            ))
-            
-            fig_roc.update_layout(
-                title='ROC Curves',
-                xaxis_title='False Positive Rate',
-                yaxis_title='True Positive Rate',
-                height=500
-            )
-            
-            st.plotly_chart(fig_roc, use_container_width=True)
-            
-            # Learning curve simulation
-            st.subheader("Learning Curve Analysis")
-            
-            # Simulate learning curve
-            train_sizes = np.linspace(0.1, 1.0, 10)
-            train_scores = []
-            test_scores = []
-            
-            # This is a simplified simulation
-            for size in train_sizes:
-                train_scores.append(0.8 + 0.15 * size)
-                test_scores.append(0.7 + 0.2 * size)
-            
-            fig_lc = go.Figure()
-            fig_lc.add_trace(go.Scatter(
-                x=train_sizes*100, y=train_scores,
-                mode='lines+markers',
-                name='Training Score'
-            ))
-            fig_lc.add_trace(go.Scatter(
-                x=train_sizes*100, y=test_scores,
-                mode='lines+markers',
-                name='Cross-validation Score'
-            ))
-            
-            fig_lc.update_layout(
-                title='Learning Curves',
-                xaxis_title='Training Set Size (%)',
-                yaxis_title='Score',
-                height=400
-            )
-            
-            st.plotly_chart(fig_lc, use_container_width=True)
-            
-        else:
-            st.info("Train a model first to see evaluation metrics.")
+            with col_pred2:
+                # Confidence bar
+                confidence_pct = confidence * 100
+                st.metric("AI Confidence", f"{confidence_pct:.1f}%")
+                
+                # Progress bar
+                st.progress(confidence)
+                
+                if confidence > 0.8:
+                    st.success("High confidence prediction")
+                elif confidence > 0.6:
+                    st.warning("Medium confidence prediction")
+                else:
+                    st.error("Low confidence prediction")
     
-    with tab5:
-        st.header("⚡ Edge Deployment")
-        
-        st.info("""
-        ### Edge Impulse Deployment
-        
-        This system can export models for deployment on edge devices:
-        - Microcontrollers (Arduino, ESP32)
-        - Single-board computers (Raspberry Pi)
-        - Mobile devices
-        """)
-        
-        col_edge1, col_edge2 = st.columns(2)
-        
-        with col_edge1:
-            st.subheader("📤 Export for Edge")
+    # Row 4: DATA HISTORY & LOGS
+    st.subheader("📋 DATA HISTORY & LOGS")
+    
+    tab_logs1, tab_logs2, tab_logs3 = st.tabs(["Sensor History", "LED Commands", "System Logs"])
+    
+    with tab_logs1:
+        if len(st.session_state.history["temperatures"]) > 0:
+            # Create history dataframe
+            history_df = pd.DataFrame({
+                'Time': list(st.session_state.history["timestamps"]),
+                'Temperature (°C)': list(st.session_state.history["temperatures"]),
+                'Humidity (%)': list(st.session_state.history["humidities"])
+            })
             
-            if st.button("🔄 Generate Edge Package", type="primary"):
-                with st.spinner("Creating edge deployment package..."):
-                    if st.session_state.ml_system.export_to_edge_impulse():
-                        st.success("✅ Edge package created!")
-                        
-                        # Show download buttons
-                        st.download_button(
-                            label="📥 Download Model Package",
-                            data=open('edge_model.pkl', 'rb').read(),
-                            file_name="iot_edge_model.zip",
-                            mime="application/zip"
-                        )
-        
-        with col_edge2:
-            st.subheader("📋 Edge Requirements")
+            st.dataframe(history_df.tail(20), use_container_width=True)
             
-            st.code("""
-# Edge Device Requirements:
-- 32KB RAM minimum
-- 128KB Flash storage
-- Temperature/Humidity sensor
-- WiFi/BLE connectivity
-- LED output pins
+            # Statistics
+            col_stat1, col_stat2, col_stat3 = st.columns(3)
+            with col_stat1:
+                if len(st.session_state.history["temperatures"]) > 0:
+                    avg_temp = np.mean(list(st.session_state.history["temperatures"]))
+                    st.metric("Avg Temperature", f"{avg_temp:.1f}°C")
             
-# Deployment Steps:
-1. Upload model to Edge Impulse
-2. Create deployment package
-3. Flash to device
-4. Connect sensors
-5. Monitor via dashboard
-            """)
+            with col_stat2:
+                if len(st.session_state.history["humidities"]) > 0:
+                    avg_hum = np.mean(list(st.session_state.history["humidities"]))
+                    st.metric("Avg Humidity", f"{avg_hum:.1f}%")
+            
+            with col_stat3:
+                st.metric("Data Points", len(st.session_state.history["timestamps"]))
+        else:
+            st.info("No sensor history available yet")
+    
+    with tab_logs2:
+        if st.session_state.history["led_commands"]:
+            commands_df = pd.DataFrame(st.session_state.history["led_commands"])
+            st.dataframe(commands_df.tail(10), use_container_width=True)
+        else:
+            st.info("No LED commands sent yet")
+    
+    with tab_logs3:
+        # System status
+        st.write("**System Status:**")
         
-        st.markdown("---")
+        status_items = [
+            ("HiveMQ Connection", "🟢 Connected" if st.session_state.sensor_live_data["mqtt_connected"] else "🔴 Disconnected"),
+            ("Data Receiving", "🟢 Active" if st.session_state.sensor_live_data["data_received"] else "🟡 Waiting"),
+            ("AI Model", "🟢 Trained" if st.session_state.ml_system and st.session_state.ml_system.is_trained else "🟡 Not Trained"),
+            ("Control Mode", st.session_state.sensor_live_data["led_mode"].upper()),
+            ("Active LED", st.session_state.sensor_live_data["led_status"].upper())
+        ]
         
-        st.subheader("📱 Mobile App Integration")
-        
-        st.code("""
-// Example Android code for edge inference
-public class SensorPredictor {
-    public String predict(float temp, float hum) {
-        // Load edge model
-        EdgeModel model = EdgeModel.load("iot_model.tflite");
-        
-        // Prepare input
-        float[] input = {temp, hum};
-        
-        // Run inference
-        float[] output = model.predict(input);
-        
-        // Get prediction
-        String[] classes = {"merah", "hijau", "kuning", "biru"};
-        int predIndex = argmax(output);
-        
-        return classes[predIndex];
-    }
-}
-        """)
+        for label, value in status_items:
+            st.write(f"**{label}:** {value}")
+    
+    # Auto-refresh setiap 3 detik untuk data real-time
+    time.sleep(3)
+    st.rerun()
 
+# =============== INITIALIZE AND RUN ===============
 if __name__ == "__main__":
-    main()
+    # Initialize ML system
+    if st.session_state.ml_system is None:
+        st.session_state.ml_system = RealMLSystem()
+    
+    # Run main app
+    try:
+        main()
+    except Exception as e:
+        st.error(f"⚠️ Application error: {str(e)}")
+        st.info("Please refresh the page and try again")
