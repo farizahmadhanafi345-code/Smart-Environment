@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.dummy import DummyClassifier
 from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
                            f1_score, confusion_matrix, classification_report,
                            ConfusionMatrixDisplay)
@@ -20,19 +21,18 @@ import time
 warnings.filterwarnings('ignore')
 
 # ==================== KONFIGURASI ====================
-# Sesuaikan dengan struktur folder Anda
-BASE_DIR = "Data_Collector"  # Folder tempat CSV disimpan
+BASE_DIR = "Data_Collector"
 CSV_FILE = os.path.join(BASE_DIR, "sensor_data.csv")
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
 
-# MQTT Configuration - SAMA dengan ESP32
+# MQTT Configuration
 MQTT_BROKER = "76c4ab43d10547d5a223d4648d43ceb6.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 MQTT_USERNAME = "hivemq.webclient.1764923408610"
 MQTT_PASSWORD = "9y&f74G1*pWSD.tQdXa@"
 
-# Topics - SAMA dengan ESP32
+# Topics
 SUB_TOPIC_DHT = "sic/dibimbing/kelompok-SENSOR/FARIZ/pub/dht"
 PUB_TOPIC_PREDICTION = "sic/dibimbing/kelompok-SENSOR/FARIZ/pub/ml_prediction"
 
@@ -41,8 +41,6 @@ os.makedirs(REPORTS_DIR, exist_ok=True)
 
 # ==================== MQTT MANAGER ====================
 class MQTTManager:
-    """Manage MQTT connection and publishing"""
-    
     def __init__(self):
         self.client = mqtt.Client()
         self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
@@ -50,7 +48,6 @@ class MQTTManager:
         self.connected = False
         
     def connect(self):
-        """Connect to MQTT broker"""
         try:
             print(f"🔗 Connecting to MQTT: {MQTT_BROKER}:{MQTT_PORT}")
             self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
@@ -63,13 +60,11 @@ class MQTTManager:
             return False
     
     def publish_prediction(self, model_name, prediction_data):
-        """Publish prediction from specific model"""
         if not self.connected:
             print(f"⚠️  MQTT not connected, skipping publish")
             return False
         
         try:
-            # Add model name to data
             prediction_data['model'] = model_name
             prediction_data['publish_time'] = datetime.now().strftime('%H:%M:%S')
             
@@ -88,7 +83,6 @@ class MQTTManager:
             return False
     
     def subscribe_to_sensor_data(self):
-        """Subscribe to sensor data topic"""
         if self.connected:
             self.client.subscribe(SUB_TOPIC_DHT)
             print(f"📡 Subscribed to: {SUB_TOPIC_DHT}")
@@ -96,7 +90,6 @@ class MQTTManager:
         return False
     
     def disconnect(self):
-        """Disconnect from MQTT"""
         if self.connected:
             self.client.disconnect()
             self.connected = False
@@ -136,7 +129,8 @@ def load_and_prepare_data():
     # Display dataset info
     print("\n📊 Dataset Info:")
     print(f"   Total records: {len(df)}")
-    print(f"   Date range: {df['date'].min()} to {df['date'].max()}")
+    if 'date' in df.columns:
+        print(f"   Date range: {df['date'].min()} to {df['date'].max()}")
     
     # Check labels
     unique_labels = df['label'].unique()
@@ -153,11 +147,22 @@ def load_and_prepare_data():
     print("\n🔧 Processing timestamp...")
     try:
         # Split timestamp into hour, minute, second
-        df[['hour', 'minute', 'second']] = df['timestamp'].str.split(';', expand=True).astype(int)
-        print(f"   Timestamp processed successfully")
+        if 'timestamp' in df.columns:
+            df[['hour', 'minute', 'second']] = df['timestamp'].str.split(';', expand=True).astype(int)
+            print(f"   Timestamp processed successfully")
+        else:
+            print("⚠️  Timestamp column not found, using current time")
+            current_time = datetime.now()
+            df['hour'] = current_time.hour
+            df['minute'] = current_time.minute
+            df['second'] = current_time.second
     except Exception as e:
         print(f"❌ Error processing timestamp: {e}")
-        return None
+        print("⚠️  Using current time instead")
+        current_time = datetime.now()
+        df['hour'] = current_time.hour
+        df['minute'] = current_time.minute
+        df['second'] = current_time.second
     
     # Features and target
     X = df[['temperature', 'humidity', 'hour', 'minute']]
@@ -171,14 +176,27 @@ def load_and_prepare_data():
     print(f"\n⚖️  Class balance check:")
     class_counts = y.value_counts()
     for class_id, count in class_counts.items():
-        label_name = df[df['label_encoded'] == class_id]['label'].iloc[0]
+        if 'label' in df.columns:
+            matching_rows = df[df['label_encoded'] == class_id]
+            if len(matching_rows) > 0:
+                label_name = matching_rows['label'].iloc[0]
+            else:
+                label_name = f'Class_{class_id}'
+        else:
+            label_name = f'Class_{class_id}'
         percentage = (count / len(y)) * 100
         print(f"   Class {class_id} ({label_name}): {count} samples ({percentage:.1f}%)")
     
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    # Split data - use stratify only if we have at least 2 classes
+    if len(class_counts) >= 2:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+    else:
+        print("⚠️  Only 1 class in data, cannot stratify")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
     
     # Standardize
     scaler = StandardScaler()
@@ -194,165 +212,279 @@ def load_and_prepare_data():
 # ==================== TRAIN ALL MODELS ====================
 def train_all_models(X_train, X_test, y_train, y_test):
     print("\n" + "="*60)
-    print("🤖 TRAINING 3 ML MODELS")
+    print("🤖 TRAINING ML MODELS")
     print("="*60)
     
-    # Define all models
-    models = {
-        'Decision Tree': DecisionTreeClassifier(
-            max_depth=5,
-            random_state=42,
-            criterion='gini',
-            min_samples_split=10,
-            min_samples_leaf=5
-        ),
-        'K-Nearest Neighbors': KNeighborsClassifier(
-            n_neighbors=5,
-            weights='distance',
-            metric='euclidean',
-            algorithm='auto'
-        ),
-        'Logistic Regression': LogisticRegression(
+    results = {}
+    label_names = ['DINGIN', 'NORMAL', 'PANAS']
+    
+    # Cek jumlah kelas unik dalam data training
+    unique_classes_train = np.unique(y_train)
+    num_classes_train = len(unique_classes_train)
+    print(f"📊 Classes in training data: {unique_classes_train}")
+    print(f"📊 Number of unique classes: {num_classes_train}")
+    
+    # Define models based on available classes
+    models = {}
+    
+    # Always include Decision Tree
+    print("\n➕ Adding Decision Tree...")
+    models['Decision Tree'] = DecisionTreeClassifier(
+        max_depth=5,
+        random_state=42,
+        criterion='gini',
+        min_samples_split=10,
+        min_samples_leaf=5
+    )
+    
+    # Always include KNN
+    print("➕ Adding K-Nearest Neighbors...")
+    models['K-Nearest Neighbors'] = KNeighborsClassifier(
+        n_neighbors=min(5, len(X_train)),
+        weights='distance',
+        metric='euclidean',
+        algorithm='auto'
+    )
+    
+    # Only include Logistic Regression if we have at least 2 classes
+    if num_classes_train >= 2:
+        print("➕ Adding Logistic Regression...")
+        models['Logistic Regression'] = LogisticRegression(
             random_state=42,
             max_iter=1000,
             multi_class='ovr',
             solver='liblinear',
             C=1.0
         )
-    }
+    else:
+        print("⚠️  Logistic Regression skipped: Need at least 2 classes in data")
+        print("➕ Adding Dummy Classifier as alternative...")
+        models['Dummy Classifier'] = DummyClassifier(strategy='most_frequent')
     
-    results = {}
-    label_names = ['DINGIN', 'NORMAL', 'PANAS']
+    print(f"\n📋 Total models to train: {len(models)}")
     
     for name, model in models.items():
         print(f"\n🏃 Training {name}...")
         
-        # Train model
-        model.fit(X_train, y_train)
-        
-        # Predictions
-        y_pred = model.predict(X_test)
-        y_pred_proba = model.predict_proba(X_test) if hasattr(model, "predict_proba") else None
-        
-        # Calculate metrics
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
-        recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
-        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
-        
-        # Cross-validation
-        cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='accuracy')
-        
-        # Per-class metrics
         try:
-            precision_per_class = precision_score(y_test, y_pred, average=None, zero_division=0)
-            recall_per_class = recall_score(y_test, y_pred, average=None, zero_division=0)
-            f1_per_class = f1_score(y_test, y_pred, average=None, zero_division=0)
-        except:
-            precision_per_class = [0, 0, 0]
-            recall_per_class = [0, 0, 0]
-            f1_per_class = [0, 0, 0]
-        
-        # Detailed classification report
-        report = classification_report(y_test, y_pred, 
-                                      target_names=label_names,
-                                      output_dict=True)
-        
-        # Store results
-        results[name] = {
-            'model': model,
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1_score': f1,
-            'cv_mean': cv_scores.mean(),
-            'cv_std': cv_scores.std(),
-            'y_pred': y_pred,
-            'y_pred_proba': y_pred_proba,
-            'precision_per_class': precision_per_class,
-            'recall_per_class': recall_per_class,
-            'f1_per_class': f1_per_class,
-            'classification_report': report
-        }
-        
-        print(f"   ✅ Accuracy: {accuracy:.4f}")
-        print(f"   📊 F1-Score: {f1:.4f}")
-        print(f"   🔍 Precision: {precision:.4f}")
-        print(f"   📈 Recall: {recall:.4f}")
-        print(f"   🔄 CV Accuracy: {cv_scores.mean():.4f} (±{cv_scores.std():.4f})")
-        
-        # Show predictions count
-        unique, counts = np.unique(y_pred, return_counts=True)
-        print(f"   🎯 Predictions distribution:")
-        for label_code, count in zip(unique, counts):
-            label_name = label_names[label_code] if label_code < 3 else f'Class_{label_code}'
-            print(f"      {label_name}: {count}")
+            # Train model
+            model.fit(X_train, y_train)
+            
+            # Predictions
+            y_pred = model.predict(X_test)
+            y_pred_proba = model.predict_proba(X_test) if hasattr(model, "predict_proba") else None
+            
+            # Calculate metrics
+            accuracy = accuracy_score(y_test, y_pred)
+            
+            # For weighted metrics, handle single class case
+            if num_classes_train >= 2:
+                precision = precision_score(y_test, y_pred, average='weighted', zero_division=0)
+                recall = recall_score(y_test, y_pred, average='weighted', zero_division=0)
+                f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+            else:
+                # For single class, all predictions should be correct
+                precision = 1.0 if accuracy == 1.0 else 0.0
+                recall = 1.0 if accuracy == 1.0 else 0.0
+                f1 = 1.0 if accuracy == 1.0 else 0.0
+            
+            # Cross-validation - adjust folds based on sample size
+            cv_folds = min(5, len(X_train))
+            try:
+                cv_scores = cross_val_score(model, X_train, y_train, cv=cv_folds, scoring='accuracy')
+                cv_mean = cv_scores.mean()
+                cv_std = cv_scores.std()
+            except:
+                cv_mean = accuracy
+                cv_std = 0.0
+            
+            # Per-class metrics for all possible classes (0, 1, 2)
+            all_classes = [0, 1, 2]
+            
+            precision_per_class = []
+            recall_per_class = []
+            f1_per_class = []
+            
+            for class_label in all_classes:
+                # Create binary arrays for this class
+                y_test_binary = (y_test == class_label).astype(int)
+                y_pred_binary = (y_pred == class_label).astype(int)
+                
+                if np.sum(y_test_binary) > 0 or np.sum(y_pred_binary) > 0:
+                    try:
+                        prec = precision_score(y_test_binary, y_pred_binary, zero_division=0)
+                        rec = recall_score(y_test_binary, y_pred_binary, zero_division=0)
+                        f1c = f1_score(y_test_binary, y_pred_binary, zero_division=0)
+                    except:
+                        prec = rec = f1c = 0.0
+                else:
+                    # If class doesn't exist, set metrics to 0
+                    prec = rec = f1c = 0.0
+                
+                precision_per_class.append(prec)
+                recall_per_class.append(rec)
+                f1_per_class.append(f1c)
+            
+            # Convert to numpy arrays
+            precision_per_class = np.array(precision_per_class)
+            recall_per_class = np.array(recall_per_class)
+            f1_per_class = np.array(f1_per_class)
+            
+            # Detailed classification report
+            try:
+                # Get classes present in y_test or y_pred
+                present_classes = np.unique(np.concatenate([y_test.values if hasattr(y_test, 'values') else y_test, 
+                                                          y_pred]))
+                present_classes = sorted(present_classes)
+                
+                # Filter label names to only those present
+                present_labels = []
+                for cls in present_classes:
+                    if cls < len(label_names):
+                        present_labels.append(label_names[cls])
+                    else:
+                        present_labels.append(f'Class_{cls}')
+                
+                report = classification_report(y_test, y_pred, 
+                                              labels=present_classes,
+                                              target_names=present_labels,
+                                              output_dict=True,
+                                              zero_division=0)
+            except Exception as e:
+                print(f"   ⚠️  Classification report warning: {e}")
+                report = {
+                    'accuracy': accuracy,
+                    'weighted avg': {
+                        'precision': precision,
+                        'recall': recall,
+                        'f1-score': f1
+                    }
+                }
+            
+            # Store results
+            results[name] = {
+                'model': model,
+                'accuracy': accuracy,
+                'precision': precision,
+                'recall': recall,
+                'f1_score': f1,
+                'cv_mean': cv_mean,
+                'cv_std': cv_std,
+                'y_pred': y_pred,
+                'y_pred_proba': y_pred_proba,
+                'precision_per_class': precision_per_class,
+                'recall_per_class': recall_per_class,
+                'f1_per_class': f1_per_class,
+                'classification_report': report
+            }
+            
+            print(f"   ✅ Accuracy: {accuracy:.4f}")
+            print(f"   📊 F1-Score: {f1:.4f}")
+            print(f"   🔍 Precision: {precision:.4f}")
+            print(f"   📈 Recall: {recall:.4f}")
+            print(f"   🔄 CV Accuracy: {cv_mean:.4f} (±{cv_std:.4f})")
+            
+            # Show predictions count
+            unique, counts = np.unique(y_pred, return_counts=True)
+            print(f"   🎯 Predictions distribution:")
+            for label_code, count in zip(unique, counts):
+                if label_code < len(label_names):
+                    label_name = label_names[label_code]
+                else:
+                    label_name = f'Class_{label_code}'
+                print(f"      {label_name}: {count}")
+                
+        except Exception as e:
+            print(f"❌ Error training {name}: {e}")
+            print(f"   ⚠️  Skipping this model")
     
     return results, label_names
 
 # ==================== CREATE ALL VISUALIZATIONS ====================
 def create_all_visualizations(results, X_test_df, y_test, label_names):
+    if not results:
+        print("❌ No models trained, skipping visualizations")
+        return
+    
     print("\n📊 CREATING VISUALIZATIONS FOR ALL MODELS...")
     
-    # Set style
     plt.style.use('seaborn-v0_8-darkgrid')
     
-    # 1. CONFUSION MATRICES - 3 MODELS
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('CONFUSION MATRICES - ALL MODELS', fontsize=16, fontweight='bold')
-    
-    for idx, (name, result) in enumerate(results.items()):
-        ax = axes[idx]
-        cm = confusion_matrix(y_test, result['y_pred'])
+    # 1. CONFUSION MATRICES
+    num_models = len(results)
+    if num_models > 0:
+        fig, axes = plt.subplots(1, num_models, figsize=(5*num_models, 5))
+        if num_models == 1:
+            axes = [axes]
         
-        disp = ConfusionMatrixDisplay(
-            confusion_matrix=cm,
-            display_labels=label_names
-        )
+        fig.suptitle('CONFUSION MATRICES - ALL MODELS', fontsize=16, fontweight='bold')
         
-        disp.plot(cmap='Blues', ax=ax, values_format='d')
-        ax.set_title(f'{name}', fontweight='bold', fontsize=12)
+        for idx, (name, result) in enumerate(results.items()):
+            ax = axes[idx]
+            cm = confusion_matrix(y_test, result['y_pred'])
+            
+            # Get unique labels that exist in data
+            unique_preds = np.unique(result['y_pred'])
+            unique_tests = np.unique(y_test)
+            all_unique = np.unique(np.concatenate([unique_preds, unique_tests]))
+            all_unique = sorted(all_unique)
+            
+            # Create display labels
+            display_labels = []
+            for i in all_unique:
+                if i < len(label_names):
+                    display_labels.append(label_names[i])
+                else:
+                    display_labels.append(f'Class_{i}')
+            
+            disp = ConfusionMatrixDisplay(
+                confusion_matrix=cm,
+                display_labels=display_labels
+            )
+            
+            disp.plot(cmap='Blues', ax=ax, values_format='d')
+            ax.set_title(f'{name}', fontweight='bold', fontsize=12)
+            
+            accuracy = result['accuracy']
+            ax.text(0.95, -0.15, f'Accuracy: {accuracy:.3f}', 
+                    transform=ax.transAxes, ha='right', fontsize=10)
         
-        # Add accuracy text
-        accuracy = result['accuracy']
-        ax.text(0.95, -0.15, f'Accuracy: {accuracy:.3f}', 
-                transform=ax.transAxes, ha='right', fontsize=10)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(REPORTS_DIR, 'all_confusion_matrices.png'), 
-                dpi=300, bbox_inches='tight')
-    print("✅ Saved: all_confusion_matrices.png")
+        plt.tight_layout()
+        plt.savefig(os.path.join(REPORTS_DIR, 'all_confusion_matrices.png'), 
+                    dpi=300, bbox_inches='tight')
+        print("✅ Saved: all_confusion_matrices.png")
     
     # 2. MODEL COMPARISON BAR CHART
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle('MODEL PERFORMANCE COMPARISON', fontsize=16, fontweight='bold')
-    
-    metrics_list = ['accuracy', 'precision', 'recall', 'f1_score']
-    metric_names = ['Accuracy', 'Precision', 'Recall', 'F1-Score']
-    
-    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1']  # Red, Teal, Blue
-    
-    for idx, (metric, title) in enumerate(zip(metrics_list, metric_names)):
-        ax = axes[idx//2, idx%2]
-        model_names = list(results.keys())
-        scores = [results[model][metric] for model in model_names]
+    if len(results) > 0:
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle('MODEL PERFORMANCE COMPARISON', fontsize=16, fontweight='bold')
         
-        bars = ax.bar(model_names, scores, color=colors, alpha=0.8)
-        ax.set_title(title, fontweight='bold', fontsize=12)
-        ax.set_ylabel('Score', fontsize=10)
-        ax.set_ylim(0, 1.1)
-        ax.grid(True, alpha=0.3, axis='y')
+        metrics_list = ['accuracy', 'precision', 'recall', 'f1_score']
+        metric_names = ['Accuracy', 'Precision', 'Recall', 'F1-Score']
         
-        # Add value labels
-        for bar in bars:
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2., height + 0.02,
-                   f'{height:.3f}', ha='center', va='bottom', fontsize=9)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(REPORTS_DIR, 'model_comparison.png'), 
-                dpi=300, bbox_inches='tight')
-    print("✅ Saved: model_comparison.png")
+        colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+        
+        for idx, (metric, title) in enumerate(zip(metrics_list, metric_names)):
+            ax = axes[idx//2, idx%2]
+            model_names = list(results.keys())
+            scores = [results[model][metric] for model in model_names]
+            
+            bars = ax.bar(model_names, scores, color=colors[:len(model_names)], alpha=0.8)
+            ax.set_title(title, fontweight='bold', fontsize=12)
+            ax.set_ylabel('Score', fontsize=10)
+            ax.set_ylim(0, 1.1)
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            # Add value labels
+            for bar in bars:
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height + 0.02,
+                       f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(REPORTS_DIR, 'model_comparison.png'), 
+                    dpi=300, bbox_inches='tight')
+        print("✅ Saved: model_comparison.png")
     
     # 3. FEATURE IMPORTANCE (Decision Tree)
     if 'Decision Tree' in results:
@@ -384,120 +516,157 @@ def create_all_visualizations(results, X_test_df, y_test, label_names):
         print("✅ Saved: feature_importance.png")
     
     # 4. RECALL PER CLASS COMPARISON
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    x = np.arange(len(label_names))
-    width = 0.25
-    
-    for i, (model_name, result) in enumerate(results.items()):
-        recalls = result['recall_per_class']
-        offset = width * i
-        ax.bar(x + offset, recalls, width, label=model_name, alpha=0.8)
+    if len(results) > 0:
+        fig, ax = plt.subplots(figsize=(12, 6))
         
-        # Add value labels
-        for j, recall in enumerate(recalls):
-            ax.text(j + offset, recall + 0.02, f'{recall:.3f}', 
-                   ha='center', va='bottom', fontsize=9)
-    
-    ax.set_title('RECALL PER CLASS - ALL MODELS', fontweight='bold', fontsize=14)
-    ax.set_xlabel('Class', fontsize=12)
-    ax.set_ylabel('Recall Score', fontsize=12)
-    ax.set_xticks(x + width)
-    ax.set_xticklabels(label_names)
-    ax.legend()
-    ax.set_ylim(0, 1.1)
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(REPORTS_DIR, 'recall_per_class.png'), 
-                dpi=300, bbox_inches='tight')
-    print("✅ Saved: recall_per_class.png")
+        # Use actual label names that exist
+        actual_labels = []
+        for i in range(len(label_names)):
+            # Check if this class exists in any model's predictions
+            class_exists = False
+            for result in results.values():
+                if len(result['recall_per_class']) > i:
+                    class_exists = True
+                    break
+            if class_exists:
+                actual_labels.append(label_names[i])
+            else:
+                actual_labels.append(f'Class_{i}')
+        
+        x = np.arange(len(actual_labels))
+        if len(actual_labels) > 0:
+            width = 0.8 / len(results) if len(results) > 0 else 0.25
+            
+            for i, (model_name, result) in enumerate(results.items()):
+                # Make sure we have enough values
+                recalls = result['recall_per_class']
+                if len(recalls) < len(actual_labels):
+                    # Pad with zeros if needed
+                    recalls = np.pad(recalls, (0, len(actual_labels) - len(recalls)), 'constant')
+                
+                offset = width * i
+                ax.bar(x + offset, recalls[:len(actual_labels)], width, label=model_name, alpha=0.8)
+                
+                for j, recall in enumerate(recalls[:len(actual_labels)]):
+                    ax.text(j + offset, recall + 0.02, f'{recall:.3f}', 
+                           ha='center', va='bottom', fontsize=9)
+            
+            ax.set_title('RECALL PER CLASS - ALL MODELS', fontweight='bold', fontsize=14)
+            ax.set_xlabel('Class', fontsize=12)
+            ax.set_ylabel('Recall Score', fontsize=12)
+            ax.set_xticks(x + width * (len(results)-1)/2 if len(results) > 1 else x)
+            ax.set_xticklabels(actual_labels)
+            ax.legend()
+            ax.set_ylim(0, 1.1)
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(REPORTS_DIR, 'recall_per_class.png'), 
+                        dpi=300, bbox_inches='tight')
+            print("✅ Saved: recall_per_class.png")
     
     # 5. CORRELATION HEATMAP
     fig, ax = plt.subplots(figsize=(8, 6))
     
-    # Combine features for correlation
-    correlation_data = pd.DataFrame(X_test_df, columns=['temperature', 'humidity', 'hour', 'minute'])
-    correlation_data['label'] = y_test.reset_index(drop=True)
-    
-    # Convert label to numeric for correlation
-    correlation_data['label_numeric'] = correlation_data['label']
-    
-    # Calculate correlation
-    corr = correlation_data.corr()
-    
-    # Plot heatmap
-    sns.heatmap(corr, annot=True, cmap='coolwarm', center=0, 
-                square=True, linewidths=1, cbar_kws={"shrink": 0.8})
-    
-    ax.set_title('FEATURE CORRELATION MATRIX', fontweight='bold', fontsize=14)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(REPORTS_DIR, 'correlation_heatmap.png'), 
-                dpi=300, bbox_inches='tight')
-    print("✅ Saved: correlation_heatmap.png")
+    try:
+        # Combine features for correlation
+        correlation_data = pd.DataFrame(X_test_df, columns=['temperature', 'humidity', 'hour', 'minute'])
+        correlation_data['label'] = y_test.reset_index(drop=True) if hasattr(y_test, 'reset_index') else y_test
+        
+        # Calculate correlation
+        corr = correlation_data.corr()
+        
+        # Plot heatmap
+        sns.heatmap(corr, annot=True, cmap='coolwarm', center=0, 
+                    square=True, linewidths=1, cbar_kws={"shrink": 0.8})
+        
+        ax.set_title('FEATURE CORRELATION MATRIX', fontweight='bold', fontsize=14)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(REPORTS_DIR, 'correlation_heatmap.png'), 
+                    dpi=300, bbox_inches='tight')
+        print("✅ Saved: correlation_heatmap.png")
+    except Exception as e:
+        print(f"⚠️  Could not create correlation heatmap: {e}")
     
     # 6. SCATTER PLOT TEMP vs HUMIDITY
     fig, ax = plt.subplots(figsize=(10, 6))
     
-    # Create color map for labels
-    colors = ['blue', 'green', 'red']  # DINGIN, NORMAL, PANAS
-    label_colors = [colors[label] for label in y_test]
-    
-    scatter = ax.scatter(X_test_df['temperature'], X_test_df['humidity'], 
-                        c=label_colors, alpha=0.6, s=50)
-    
-    ax.set_title('TEMPERATURE vs HUMIDITY (Colored by Label)', fontweight='bold', fontsize=14)
-    ax.set_xlabel('Temperature (°C)', fontsize=12)
-    ax.set_ylabel('Humidity (%)', fontsize=12)
-    
-    # Create legend
-    from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor=colors[i], label=label_names[i]) for i in range(3)]
-    ax.legend(handles=legend_elements, title='Labels')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(REPORTS_DIR, 'temp_vs_humidity.png'), 
-                dpi=300, bbox_inches='tight')
-    print("✅ Saved: temp_vs_humidity.png")
+    try:
+        # Create color map for labels
+        colors = ['blue', 'green', 'red']  # DINGIN, NORMAL, PANAS
+        label_colors = []
+        for label in y_test:
+            if label < len(colors):
+                label_colors.append(colors[label])
+            else:
+                label_colors.append('gray')
+        
+        scatter = ax.scatter(X_test_df['temperature'], X_test_df['humidity'], 
+                            c=label_colors, alpha=0.6, s=50)
+        
+        ax.set_title('TEMPERATURE vs HUMIDITY (Colored by Label)', fontweight='bold', fontsize=14)
+        ax.set_xlabel('Temperature (°C)', fontsize=12)
+        ax.set_ylabel('Humidity (%)', fontsize=12)
+        
+        # Create legend
+        from matplotlib.patches import Patch
+        legend_elements = []
+        for i in range(min(3, len(label_names))):
+            legend_elements.append(Patch(facecolor=colors[i], label=label_names[i]))
+        if len(label_names) > 3:
+            legend_elements.append(Patch(facecolor='gray', label='Other'))
+        ax.legend(handles=legend_elements, title='Labels')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(REPORTS_DIR, 'temp_vs_humidity.png'), 
+                    dpi=300, bbox_inches='tight')
+        print("✅ Saved: temp_vs_humidity.png")
+    except Exception as e:
+        print(f"⚠️  Could not create scatter plot: {e}")
     
     # 7. SUMMARY TABLE
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.axis('off')
-    
-    # Create summary data
-    summary_data = []
-    for name, result in results.items():
-        summary_data.append([
-            name,
-            f"{result['accuracy']:.4f}",
-            f"{result['precision']:.4f}",
-            f"{result['recall']:.4f}",
-            f"{result['f1_score']:.4f}",
-            f"{result['cv_mean']:.4f} ±{result['cv_std']:.4f}"
-        ])
-    
-    # Create table
-    columns = ['Model', 'Accuracy', 'Precision', 'Recall', 'F1-Score', 'CV Accuracy']
-    table = ax.table(cellText=summary_data,
-                     colLabels=columns,
-                     cellLoc='center',
-                     loc='center',
-                     colColours=['#FF6B6B'] * len(columns))
-    
-    table.auto_set_font_size(False)
-    table.set_fontsize(10)
-    table.scale(1.2, 1.8)
-    
-    plt.title('MODEL PERFORMANCE SUMMARY', fontsize=14, fontweight='bold', pad=20)
-    plt.savefig(os.path.join(REPORTS_DIR, 'performance_summary.png'), 
-                dpi=300, bbox_inches='tight')
-    print("✅ Saved: performance_summary.png")
+    if len(results) > 0:
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.axis('off')
+        
+        # Create summary data
+        summary_data = []
+        for name, result in results.items():
+            summary_data.append([
+                name,
+                f"{result['accuracy']:.4f}",
+                f"{result['precision']:.4f}",
+                f"{result['recall']:.4f}",
+                f"{result['f1_score']:.4f}",
+                f"{result['cv_mean']:.4f} ±{result['cv_std']:.4f}"
+            ])
+        
+        # Create table
+        columns = ['Model', 'Accuracy', 'Precision', 'Recall', 'F1-Score', 'CV Accuracy']
+        table = ax.table(cellText=summary_data,
+                         colLabels=columns,
+                         cellLoc='center',
+                         loc='center',
+                         colColours=['#FF6B6B'] * len(columns))
+        
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1.2, 1.8)
+        
+        plt.title('MODEL PERFORMANCE SUMMARY', fontsize=14, fontweight='bold', pad=20)
+        plt.savefig(os.path.join(REPORTS_DIR, 'performance_summary.png'), 
+                    dpi=300, bbox_inches='tight')
+        print("✅ Saved: performance_summary.png")
     
     plt.show()
 
 # ==================== SAVE ALL MODELS ====================
 def save_all_models(results, scaler):
+    if not results:
+        print("❌ No models to save")
+        return None
+    
     print("\n💾 SAVING ALL MODELS...")
     
     # Save scaler
@@ -601,11 +770,15 @@ def predict_new_data(models, scaler, temperature, humidity, hour=None, minute=No
 
 # ==================== TEST & PUBLISH TO MQTT ====================
 def test_and_publish_all_models(results, scaler, mqtt_manager):
+    if not results:
+        print("❌ No models to test")
+        return
+    
     print("\n" + "="*60)
     print("📤 TESTING & PUBLISHING ALL MODELS TO MQTT")
     print("="*60)
     
-    # Test cases based on your temperature ranges
+    # Test cases based on temperature ranges
     test_cases = [
         # (temp, hum, hour, minute, expected)
         (18.0, 75.0, 14, 30, "DINGIN"),    # < 25°C
@@ -692,6 +865,10 @@ def test_and_publish_all_models(results, scaler, mqtt_manager):
 # ==================== REAL-TIME PREDICTION MODE ====================
 def real_time_prediction_mode(results, scaler, mqtt_manager):
     """Run in real-time mode, listening for sensor data"""
+    if not results:
+        print("❌ No models available for real-time prediction")
+        return
+    
     print("\n" + "="*60)
     print("🌐 REAL-TIME PREDICTION MODE")
     print("="*60)
@@ -802,8 +979,12 @@ def main():
         
         X_train, X_test, y_train, y_test, scaler, df, X_test_df = data_result
         
-        # 2. Train all 3 models
+        # 2. Train models (will handle single class data)
         results, label_names = train_all_models(X_train, X_test, y_train, y_test)
+        
+        if not results:
+            print("❌ No models were successfully trained")
+            return
         
         # 3. Create visualizations
         create_all_visualizations(results, X_test_df, y_test, label_names)
@@ -816,7 +997,7 @@ def main():
         
         # 6. Show final summary
         print("\n" + "="*60)
-        print("🏆 TRAINING COMPLETE - ALL 3 MODELS")
+        print("🏆 TRAINING COMPLETE")
         print("="*60)
         
         print(f"\n📊 Models trained and saved:")
@@ -825,11 +1006,11 @@ def main():
             f1 = results[model_name]['f1_score']
             print(f"   • {model_name:25} → Accuracy: {acc:.4f}, F1: {f1:.4f}")
         
-        # Find best model by F1-score
-        best_model = max(results.items(), key=lambda x: x[1]['f1_score'])[0]
-        best_f1 = results[best_model]['f1_score']
-        
-        print(f"\n🏆 Best Model: {best_model} (F1-Score: {best_f1:.4f})")
+        # Find best model by F1-score if we have at least 2 models
+        if len(results) >= 2:
+            best_model = max(results.items(), key=lambda x: x[1]['f1_score'])[0]
+            best_f1 = results[best_model]['f1_score']
+            print(f"\n🏆 Best Model: {best_model} (F1-Score: {best_f1:.4f})")
         
         print(f"\n📁 Files saved:")
         print(f"   • Models: {MODELS_DIR}/")
@@ -853,7 +1034,7 @@ def main():
         if response == 'y':
             real_time_prediction_mode(results, scaler, mqtt_manager)
         
-        print("\n✅ All 3 models ready for deployment!")
+        print("\n✅ All models ready for deployment!")
         print("="*60)
         
     except Exception as e:
