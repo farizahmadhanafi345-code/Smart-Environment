@@ -1,4 +1,4 @@
-# dashboard_complete_final.py
+# dashboard_ultimate_final.py
 import streamlit as st
 import paho.mqtt.client as mqtt
 import json
@@ -14,246 +14,269 @@ import ssl
 import threading
 import pickle
 import warnings
+import socket
+import sys
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score, confusion_matrix
 warnings.filterwarnings('ignore')
 
-# ==================== KONFIGURASI HIVEMQ REAL ====================
+# ==================== KONFIGURASI HIVEMQ ====================
 MQTT_CONFIG = {
     "broker": "f44c5a09b28447449642c2c62b63bba7.s1.eu.hivemq.cloud",
     "port": 8883,
     "username": "fariz_device_main",
     "password": "F4riz#Device2025!",
     "use_ssl": True,
-    "keepalive": 60,
-    "clean_session": True
+    "keepalive": 60
 }
 
-# Topics REAL dari ESP32 Anda
+# Topics
 DHT_TOPIC = "sic/dibimbing/kelompok-SENSOR/FARIZ/pub/dht"
 LED_TOPIC = "sic/dibimbing/kelompok-SENSOR/FARIZ/sub/led"
 
-# Path untuk ML models
-ML_MODELS_DIR = "ml_models"
-os.makedirs(ML_MODELS_DIR, exist_ok=True)
+# ==================== TEST CREDENTIALS ALTERNATIF ====================
+MQTT_TEST_CONFIGS = [
+    {
+        "name": "Main Credentials",
+        "broker": "f44c5a09b28447449642c2c62b63bba7.s1.eu.hivemq.cloud",
+        "port": 8883,
+        "username": "fariz_device_main",
+        "password": "F4riz#Device2025!",
+        "use_ssl": True
+    },
+    {
+        "name": "Web Client Credentials",
+        "broker": "f44c5a09b28447449642c2c62b63bba7.s1.eu.hivemq.cloud",
+        "port": 8883,
+        "username": "hivemq.webclient.1764923408610",
+        "password": "9y&f74G1*pWSD.tQdXa@",
+        "use_ssl": True
+    },
+    {
+        "name": "Port 8884 (WebSockets)",
+        "broker": "f44c5a09b28447449642c2c62b63bba7.s1.eu.hivemq.cloud",
+        "port": 8884,
+        "username": "fariz_device_main",
+        "password": "F4riz#Device2025!",
+        "use_ssl": True
+    }
+]
 
-# ==================== DEBUG MODE ====================
-DEBUG_MODE = True
-
-def debug_log(message):
-    """Log untuk debugging"""
-    if DEBUG_MODE:
-        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        print(f"[DEBUG {timestamp}] {message}")
+# ==================== FALLBACK MODE ====================
+FALLBACK_MODE = False  # Akan diaktifkan jika MQTT gagal
 
 # ==================== INISIALISASI STATE ====================
-if 'app_state' not in st.session_state:
-    st.session_state.app_state = {
+if 'iot_dashboard' not in st.session_state:
+    st.session_state.iot_dashboard = {
         # Connection State
         "mqtt_connected": False,
-        "connection_status": "disconnected",  # disconnected, connecting, connected, error
-        "last_connection_attempt": None,
-        "connection_errors": [],
-        "reconnect_count": 0,
+        "connection_status": "disconnected",
+        "connection_test_result": None,
+        "current_config": MQTT_CONFIG,
+        "fallback_mode": False,
         
         # Sensor Data
         "temperature": 25.0,
         "humidity": 65.0,
-        "timestamp": "",
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
         "status": "NORMAL",
         "status_code": 1,
         
-        # Data History
+        # Data Storage
         "sensor_history": [],
-        "csv_records": [],
         "data_points": 0,
+        "last_update": datetime.now(),
         
         # ML System
-        "ml_models": {},  # KNN, DT, LR
-        "ml_scaler": None,
+        "ml_models": {},
         "ml_trained": False,
-        "ml_training_data": [],
         "ml_predictions": {},
-        "ml_performance": {},
+        "ml_training_data": [],
         
         # Control
         "led_status": "off",
         "auto_refresh": True,
         
         # System
-        "system_logs": [],
+        "logs": [],
         "start_time": datetime.now()
     }
 
-# ==================== LOGGING SYSTEM ====================
-def add_system_log(message, level="INFO", source="SYSTEM"):
-    """Enhanced logging system"""
+# ==================== CONNECTION TEST FUNCTION ====================
+def test_mqtt_connection(config):
+    """Test koneksi MQTT dan return hasil"""
+    try:
+        log_message(f"Testing connection: {config['name']}")
+        log_message(f"Broker: {config['broker']}:{config['port']}")
+        log_message(f"Username: {config['username']}")
+        
+        # Test network connectivity
+        try:
+            socket.create_connection((config['broker'], config['port']), timeout=5)
+            log_message("✅ Network connection OK")
+        except:
+            log_message("❌ Network connection failed")
+            return False, "Network connection failed"
+        
+        # Create MQTT client
+        client = mqtt.Client(f"test_client_{int(time.time())}")
+        
+        # Set credentials
+        client.username_pw_set(config['username'], config['password'])
+        
+        # Set SSL
+        if config.get('use_ssl', True):
+            client.tls_set(tls_version=ssl.PROTOCOL_TLS)
+            client.tls_insecure_set(True)
+        
+        connection_result = {"success": False, "error": None}
+        
+        def on_connect_test(client, userdata, flags, rc):
+            if rc == 0:
+                connection_result["success"] = True
+            else:
+                connection_result["success"] = False
+                error_msgs = {
+                    1: "Protocol version mismatch",
+                    2: "Invalid client ID",
+                    3: "Server unavailable",
+                    4: "Bad username/password",
+                    5: "Not authorized"
+                }
+                connection_result["error"] = error_msgs.get(rc, f"Error code: {rc}")
+        
+        client.on_connect = on_connect_test
+        
+        # Connect with timeout
+        client.connect(config['broker'], config['port'], 10)
+        client.loop_start()
+        
+        # Wait for connection
+        time.sleep(3)
+        
+        client.loop_stop()
+        client.disconnect()
+        
+        if connection_result["success"]:
+            log_message(f"✅ Connection test SUCCESS: {config['name']}")
+            return True, "Connection successful"
+        else:
+            log_message(f"❌ Connection test FAILED: {connection_result.get('error', 'Unknown error')}")
+            return False, connection_result.get("error", "Unknown error")
+            
+    except Exception as e:
+        error_msg = str(e)
+        log_message(f"❌ Connection exception: {error_msg}")
+        return False, error_msg
+
+# ==================== LOGGING ====================
+def log_message(message, level="INFO"):
+    """Log message ke system"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     
-    level_config = {
-        "DEBUG": {"icon": "🔍", "color": "#6B7280"},
-        "INFO": {"icon": "ℹ️", "color": "#3B82F6"},
-        "SUCCESS": {"icon": "✅", "color": "#10B981"},
-        "WARNING": {"icon": "⚠️", "color": "#F59E0B"},
-        "ERROR": {"icon": "❌", "color": "#EF4444"},
-        "MQTT": {"icon": "📡", "color": "#8B5CF6"},
-        "SENSOR": {"icon": "🌡️", "color": "#EF4444"},
-        "ML": {"icon": "🤖", "color": "#7C3AED"}
+    icons = {
+        "INFO": "ℹ️",
+        "SUCCESS": "✅",
+        "WARNING": "⚠️",
+        "ERROR": "❌",
+        "CONNECTION": "🔗",
+        "SENSOR": "🌡️",
+        "ML": "🤖"
     }
     
-    config = level_config.get(level, level_config["INFO"])
+    icon = icons.get(level, "📝")
+    
+    colors = {
+        "INFO": "#3B82F6",
+        "SUCCESS": "#10B981",
+        "WARNING": "#F59E0B",
+        "ERROR": "#EF4444",
+        "CONNECTION": "#8B5CF6",
+        "SENSOR": "#EF4444",
+        "ML": "#7C3AED"
+    }
+    
+    color = colors.get(level, "#6B7280")
     
     log_entry = {
-        "timestamp": timestamp,
+        "time": timestamp,
         "message": message,
-        "level": level,
-        "icon": config["icon"],
-        "color": config["color"],
-        "source": source
+        "icon": icon,
+        "color": color,
+        "level": level
     }
     
-    st.session_state.app_state["system_logs"].insert(0, log_entry)
+    st.session_state.iot_dashboard["logs"].insert(0, log_entry)
     
-    if len(st.session_state.app_state["system_logs"]) > 50:
-        st.session_state.app_state["system_logs"] = st.session_state.app_state["system_logs"][:50]
+    # Limit logs
+    if len(st.session_state.iot_dashboard["logs"]) > 50:
+        st.session_state.iot_dashboard["logs"] = st.session_state.iot_dashboard["logs"][:50]
     
-    # Console debug
-    debug_log(f"[{level}] {message}")
+    # Print to console
+    print(f"[{timestamp}] {icon} {message}")
 
-# ==================== ML SYSTEM (KNN, DT, LR) ====================
-class MLSystem:
+# ==================== ML SYSTEM ====================
+class ML_System:
     def __init__(self):
-        self.models = {
-            "KNN": None,
-            "Decision Tree": None,
-            "Logistic Regression": None
-        }
+        self.models = {}
         self.scaler = StandardScaler()
-        self.is_trained = False
-        self.load_models()
-    
-    def load_models(self):
-        """Load trained models dari file"""
-        try:
-            loaded_count = 0
-            
-            for name in self.models.keys():
-                model_file = os.path.join(ML_MODELS_DIR, f"{name.lower().replace(' ', '_')}.pkl")
-                if os.path.exists(model_file):
-                    with open(model_file, 'rb') as f:
-                        self.models[name] = pickle.load(f)
-                    loaded_count += 1
-                    add_system_log(f"Loaded {name} model", "SUCCESS", "ML")
-            
-            # Load scaler
-            scaler_file = os.path.join(ML_MODELS_DIR, "scaler.pkl")
-            if os.path.exists(scaler_file):
-                with open(scaler_file, 'rb') as f:
-                    self.scaler = pickle.load(f)
-            
-            if loaded_count > 0:
-                self.is_trained = True
-                st.session_state.app_state["ml_trained"] = True
-                add_system_log(f"{loaded_count} ML models loaded", "SUCCESS", "ML")
-                return True
-            else:
-                add_system_log("No trained models found", "WARNING", "ML")
-                return False
-                
-        except Exception as e:
-            add_system_log(f"Error loading models: {e}", "ERROR", "ML")
-            return False
-    
-    def prepare_training_data(self):
-        """Siapkan data training dari collected data"""
-        if len(st.session_state.app_state["ml_training_data"]) < 10:
-            return None, None, "Need at least 10 samples"
+        self.trained = False
         
+    def train_models(self, data):
+        """Train KNN, DT, LR models"""
         try:
-            df = pd.DataFrame(st.session_state.app_state["ml_training_data"])
+            if len(data) < 10:
+                return False, "Need at least 10 samples"
+            
+            df = pd.DataFrame(data)
             X = df[['temperature', 'humidity']].values
             y = df['status_code'].values
             
-            return X, y, None
-            
-        except Exception as e:
-            return None, None, str(e)
-    
-    def train_all_models(self):
-        """Train KNN, Decision Tree, dan Logistic Regression"""
-        try:
-            X, y, error = self.prepare_training_data()
-            if error:
-                return False, error
-            
             # Split data
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y
-            )
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
             
-            # Scale features
+            # Scale
             X_train_scaled = self.scaler.fit_transform(X_train)
             X_test_scaled = self.scaler.transform(X_test)
             
-            # Define models
-            models_config = {
-                "KNN": KNeighborsClassifier(n_neighbors=5, weights='distance'),
-                "Decision Tree": DecisionTreeClassifier(max_depth=5, random_state=42),
-                "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42)
+            # Train models
+            models_to_train = {
+                "KNN": KNeighborsClassifier(n_neighbors=5),
+                "Decision Tree": DecisionTreeClassifier(max_depth=5),
+                "Logistic Regression": LogisticRegression(max_iter=1000)
             }
             
-            performance = {}
+            results = {}
             
-            for name, model in models_config.items():
-                # Train model
+            for name, model in models_to_train.items():
                 model.fit(X_train_scaled, y_train)
-                
-                # Predict
                 y_pred = model.predict(X_test_scaled)
-                
-                # Calculate accuracy
                 accuracy = accuracy_score(y_test, y_pred)
                 
-                # Store model
                 self.models[name] = model
-                performance[name] = {
-                    "accuracy": float(accuracy),
-                    "model": model,
-                    "y_test": y_test,
-                    "y_pred": y_pred
+                results[name] = {
+                    "accuracy": accuracy,
+                    "model": model
                 }
                 
-                # Save model to file
-                model_file = os.path.join(ML_MODELS_DIR, f"{name.lower().replace(' ', '_')}.pkl")
-                with open(model_file, 'wb') as f:
-                    pickle.dump(model, f)
-                
-                add_system_log(f"{name} trained: {accuracy:.2%}", "SUCCESS", "ML")
+                log_message(f"{name} trained - Accuracy: {accuracy:.2%}", "ML")
             
-            # Save scaler
-            scaler_file = os.path.join(ML_MODELS_DIR, "scaler.pkl")
-            with open(scaler_file, 'wb') as f:
-                pickle.dump(self.scaler, f)
+            self.trained = True
+            st.session_state.iot_dashboard["ml_trained"] = True
+            st.session_state.iot_dashboard["ml_models"] = self.models
             
-            self.is_trained = True
-            st.session_state.app_state["ml_trained"] = True
-            st.session_state.app_state["ml_performance"] = performance
-            
-            # Update ML models in session state
-            st.session_state.app_state["ml_models"] = self.models
-            
-            return True, f"Models trained successfully with {len(X)} samples"
+            return True, "Models trained successfully"
             
         except Exception as e:
             return False, f"Training error: {str(e)}"
     
-    def predict_all(self, temperature, humidity):
-        """Predict dengan semua model"""
-        if not self.is_trained:
+    def predict(self, temperature, humidity):
+        """Make predictions with all models"""
+        if not self.trained:
             return {}
         
         try:
@@ -261,27 +284,21 @@ class MLSystem:
             features_scaled = self.scaler.transform(features)
             
             predictions = {}
-            label_map = {0: "DINGIN", 1: "NORMAL", 2: "PANAS"}
+            label_map = {0: "DINGIN 🥶", 1: "NORMAL ✅", 2: "PANAS 🔥"}
             
             for name, model in self.models.items():
-                if model is None:
-                    continue
-                
-                # Predict
                 pred_code = model.predict(features_scaled)[0]
                 
-                # Get probabilities
                 if hasattr(model, 'predict_proba'):
                     probs = model.predict_proba(features_scaled)[0]
-                    confidence = float(probs[pred_code])
+                    confidence = probs[pred_code]
                 else:
                     confidence = 1.0
                     probs = [0.33, 0.33, 0.34]
                 
                 predictions[name] = {
                     "label": label_map.get(pred_code, "UNKNOWN"),
-                    "confidence": confidence,
-                    "label_code": int(pred_code),
+                    "confidence": float(confidence),
                     "probabilities": {
                         "DINGIN": float(probs[0]) if len(probs) > 0 else 0,
                         "NORMAL": float(probs[1]) if len(probs) > 1 else 0,
@@ -292,274 +309,197 @@ class MLSystem:
             return predictions
             
         except Exception as e:
-            add_system_log(f"Prediction error: {e}", "ERROR", "ML")
+            log_message(f"Prediction error: {e}", "ERROR")
             return {}
 
-# ==================== MQTT CONNECTION MANAGER ====================
-class MQTTConnectionManager:
+# Initialize ML system
+if 'ml_system' not in st.session_state:
+    st.session_state.ml_system = ML_System()
+
+# ==================== FALLBACK DATA GENERATOR ====================
+def generate_fallback_data():
+    """Generate fallback data jika MQTT gagal"""
+    # Simulate sensor data
+    base_temp = 25.0
+    base_hum = 65.0
+    
+    # Add some variation
+    temp_variation = np.random.uniform(-2, 2)
+    hum_variation = np.random.uniform(-5, 5)
+    
+    temperature = round(base_temp + temp_variation, 1)
+    humidity = round(base_hum + hum_variation, 1)
+    
+    # Determine status
+    if temperature < 25:
+        status, color, code = "DINGIN 🥶", "#3B82F6", 0
+    elif temperature > 28:
+        status, color, code = "PANAS 🔥", "#EF4444", 2
+    else:
+        status, color, code = "NORMAL ✅", "#10B981", 1
+    
+    return temperature, humidity, status, color, code
+
+# ==================== MQTT MANAGER ====================
+class MQTT_Manager:
     def __init__(self):
         self.client = None
-        self.connection_in_progress = False
+        self.connected = False
         
-    def on_connect(self, client, userdata, flags, rc):
-        """Callback ketika terhubung"""
-        debug_log(f"on_connect called with rc={rc}")
-        
-        if rc == 0:
-            # Connection successful
-            st.session_state.app_state["mqtt_connected"] = True
-            st.session_state.app_state["connection_status"] = "connected"
-            st.session_state.app_state["reconnect_count"] = 0
-            
-            # Subscribe to topic
-            client.subscribe(DHT_TOPIC)
-            
-            add_system_log(f"✅ Connected to HiveMQ! Subscribed to {DHT_TOPIC}", "SUCCESS", "MQTT")
-            debug_log(f"Subscribed to topic: {DHT_TOPIC}")
-            
-        else:
-            # Connection failed
-            st.session_state.app_state["mqtt_connected"] = False
-            st.session_state.app_state["connection_status"] = "error"
-            
-            error_messages = {
-                1: "Incorrect protocol version",
-                2: "Invalid client identifier",
-                3: "Server unavailable",
-                4: "Bad username or password",
-                5: "Not authorized"
-            }
-            
-            error_msg = error_messages.get(rc, f"Unknown error {rc}")
-            add_system_log(f"❌ Connection failed: {error_msg}", "ERROR", "MQTT")
-    
-    def on_disconnect(self, client, userdata, rc):
-        """Callback ketika terputus"""
-        debug_log(f"on_disconnect called with rc={rc}")
-        
-        st.session_state.app_state["mqtt_connected"] = False
-        st.session_state.app_state["connection_status"] = "disconnected"
-        
-        if rc != 0:
-            add_system_log("⚠️ Unexpected disconnection", "WARNING", "MQTT")
-            # Try to reconnect
-            self.schedule_reconnect()
-    
-    def on_message(self, client, userdata, msg):
-        """Callback ketika menerima pesan"""
+    def connect(self, config):
+        """Connect to MQTT broker"""
         try:
-            debug_log(f"Message received on topic: {msg.topic}")
+            log_message(f"Connecting to {config['broker']}...", "CONNECTION")
             
-            data = json.loads(msg.payload.decode('utf-8'))
-            temperature = float(data.get('temperature', 0))
-            humidity = float(data.get('humidity', 0))
-            
-            debug_log(f"Parsed data: temp={temperature}, hum={humidity}")
-            
-            # Determine status
-            if temperature < 25:
-                status, color, code = "DINGIN 🥶", "#3B82F6", 0
-            elif temperature > 28:
-                status, color, code = "PANAS 🔥", "#EF4444", 2
-            else:
-                status, color, code = "NORMAL ✅", "#10B981", 1
-            
-            # Update sensor data
-            st.session_state.app_state.update({
-                "temperature": temperature,
-                "humidity": humidity,
-                "timestamp": datetime.now().strftime("%H:%M:%S"),
-                "status": status,
-                "status_code": code,
-                "data_points": st.session_state.app_state["data_points"] + 1
-            })
-            
-            # Add to history
-            st.session_state.app_state["sensor_history"].append({
-                "timestamp": datetime.now(),
-                "temperature": temperature,
-                "humidity": humidity,
-                "status": status.split()[0],
-                "color": color
-            })
-            
-            # Keep only last 100 records
-            if len(st.session_state.app_state["sensor_history"]) > 100:
-                st.session_state.app_state["sensor_history"] = st.session_state.app_state["sensor_history"][-100:]
-            
-            # Add to ML training data
-            st.session_state.app_state["ml_training_data"].append({
-                "temperature": temperature,
-                "humidity": humidity,
-                "status_code": code
-            })
-            
-            # Make ML predictions if trained
-            if 'ml_system' in st.session_state and st.session_state.ml_system.is_trained:
-                predictions = st.session_state.ml_system.predict_all(temperature, humidity)
-                st.session_state.app_state["ml_predictions"] = predictions
-            
-            # Save to CSV
-            self.save_to_csv(temperature, humidity, status, code)
-            
-            add_system_log(f"📡 Data: {temperature:.1f}°C, {humidity:.1f}% → {status}", "SENSOR", "SENSOR")
-            
-        except Exception as e:
-            add_system_log(f"Error processing message: {e}", "ERROR", "MQTT")
-    
-    def save_to_csv(self, temperature, humidity, status, code):
-        """Simpan data ke CSV"""
-        try:
-            csv_file = "iot_data.csv"
-            file_exists = os.path.exists(csv_file)
-            
-            with open(csv_file, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f, delimiter=';')
-                
-                if not file_exists:
-                    writer.writerow(['timestamp', 'temperature', 'humidity', 'status', 'status_code'])
-                
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                writer.writerow([
-                    timestamp,
-                    f"{temperature:.2f}",
-                    f"{humidity:.2f}",
-                    status,
-                    code
-                ])
-            
-            # Store in memory for display
-            st.session_state.app_state["csv_records"].append({
-                "timestamp": timestamp,
-                "temperature": temperature,
-                "humidity": humidity,
-                "status": status.split()[0]
-            })
-            
-            if len(st.session_state.app_state["csv_records"]) > 20:
-                st.session_state.app_state["csv_records"] = st.session_state.app_state["csv_records"][-20:]
-                
-        except Exception as e:
-            add_system_log(f"CSV save error: {e}", "ERROR", "SYSTEM")
-    
-    def schedule_reconnect(self):
-        """Jadwalkan reconnect"""
-        if st.session_state.app_state["reconnect_count"] < 5:  # Max 5 attempts
-            st.session_state.app_state["reconnect_count"] += 1
-            delay = min(2 ** st.session_state.app_state["reconnect_count"], 30)
-            
-            add_system_log(f"Reconnect attempt {st.session_state.app_state['reconnect_count']} in {delay}s", "WARNING", "MQTT")
-            
-            def reconnect():
-                time.sleep(delay)
-                if not st.session_state.app_state["mqtt_connected"]:
-                    self.connect_mqtt()
-            
-            threading.Thread(target=reconnect, daemon=True).start()
-    
-    def connect_mqtt(self):
-        """Connect ke MQTT broker"""
-        if self.connection_in_progress:
-            return False
-        
-        try:
-            self.connection_in_progress = True
-            st.session_state.app_state["connection_status"] = "connecting"
-            st.session_state.app_state["last_connection_attempt"] = datetime.now()
-            
-            add_system_log(f"Connecting to {MQTT_CONFIG['broker']}:{MQTT_CONFIG['port']}...", "INFO", "MQTT")
+            # Test connection first
+            success, message = test_mqtt_connection(config)
+            if not success:
+                return False, message
             
             # Create client
-            client_id = f"dashboard_{int(time.time())}"
-            self.client = mqtt.Client(client_id=client_id, clean_session=MQTT_CONFIG["clean_session"])
+            self.client = mqtt.Client(f"dashboard_{int(time.time())}")
+            self.client.username_pw_set(config['username'], config['password'])
             
-            # Set credentials
-            self.client.username_pw_set(MQTT_CONFIG["username"], MQTT_CONFIG["password"])
-            
-            # Set SSL if enabled
-            if MQTT_CONFIG["use_ssl"]:
+            if config.get('use_ssl', True):
                 self.client.tls_set(tls_version=ssl.PROTOCOL_TLS)
-                self.client.tls_insecure_set(True)  # For testing
+                self.client.tls_insecure_set(True)
             
-            # Set callbacks
             self.client.on_connect = self.on_connect
             self.client.on_disconnect = self.on_disconnect
             self.client.on_message = self.on_message
             
-            # Connect
-            self.client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], keepalive=MQTT_CONFIG["keepalive"])
-            
-            # Start network loop
+            self.client.connect(config['broker'], config['port'], 60)
             self.client.loop_start()
             
-            # Wait for connection result
-            for i in range(20):  # Wait up to 2 seconds
-                if st.session_state.app_state["mqtt_connected"]:
-                    break
-                time.sleep(0.1)
+            # Wait for connection
+            time.sleep(2)
             
-            self.connection_in_progress = False
-            
-            if st.session_state.app_state["mqtt_connected"]:
-                return True
+            if self.connected:
+                st.session_state.iot_dashboard["current_config"] = config
+                return True, "Connected successfully"
             else:
-                add_system_log("Connection timeout", "ERROR", "MQTT")
-                return False
+                return False, "Connection timeout"
                 
         except Exception as e:
-            self.connection_in_progress = False
-            st.session_state.app_state["connection_status"] = "error"
-            
-            error_msg = str(e)
-            add_system_log(f"Connection error: {error_msg}", "ERROR", "MQTT")
-            
-            # Store error
-            st.session_state.app_state["connection_errors"].append({
-                "time": datetime.now(),
-                "error": error_msg
-            })
-            
-            return False
+            return False, str(e)
     
-    def disconnect_mqtt(self):
-        """Disconnect dari MQTT broker"""
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.connected = True
+            st.session_state.iot_dashboard["mqtt_connected"] = True
+            st.session_state.iot_dashboard["connection_status"] = "connected"
+            client.subscribe(DHT_TOPIC)
+            log_message("✅ MQTT Connected and subscribed!", "SUCCESS")
+        else:
+            log_message(f"❌ Connection failed: {rc}", "ERROR")
+    
+    def on_disconnect(self, client, userdata, rc):
+        self.connected = False
+        st.session_state.iot_dashboard["mqtt_connected"] = False
+        st.session_state.iot_dashboard["connection_status"] = "disconnected"
+        log_message("⚠️ Disconnected from MQTT", "WARNING")
+    
+    def on_message(self, client, userdata, msg):
         try:
-            if self.client:
-                self.client.loop_stop()
-                self.client.disconnect()
-                st.session_state.app_state["mqtt_connected"] = False
-                st.session_state.app_state["connection_status"] = "disconnected"
-                add_system_log("Disconnected from MQTT", "INFO", "MQTT")
-                return True
-        except:
-            pass
-        return False
+            data = json.loads(msg.payload.decode())
+            temperature = float(data.get('temperature', 0))
+            humidity = float(data.get('humidity', 0))
+            
+            # Update data
+            update_sensor_data(temperature, humidity, "MQTT")
+            
+        except Exception as e:
+            log_message(f"Message error: {e}", "ERROR")
+    
+    def disconnect(self):
+        if self.client:
+            self.client.loop_stop()
+            self.client.disconnect()
+            self.connected = False
+            st.session_state.iot_dashboard["mqtt_connected"] = False
+            log_message("Disconnected", "INFO")
     
     def send_led_command(self, command):
-        """Kirim perintah LED"""
-        if self.client and st.session_state.app_state["mqtt_connected"]:
+        if self.connected and self.client:
             try:
                 self.client.publish(LED_TOPIC, command)
-                st.session_state.app_state["led_status"] = command
-                add_system_log(f"LED command sent: {command}", "SUCCESS", "CONTROL")
+                st.session_state.iot_dashboard["led_status"] = command
+                log_message(f"LED: {command}", "INFO")
                 return True
-            except Exception as e:
-                add_system_log(f"Failed to send LED command: {e}", "ERROR", "CONTROL")
+            except:
                 return False
         return False
 
-# ==================== INITIALIZE SYSTEMS ====================
+# Initialize MQTT manager
 if 'mqtt_manager' not in st.session_state:
-    st.session_state.mqtt_manager = MQTTConnectionManager()
+    st.session_state.mqtt_manager = MQTT_Manager()
 
-if 'ml_system' not in st.session_state:
-    st.session_state.ml_system = MLSystem()
+# ==================== DATA UPDATE FUNCTION ====================
+def update_sensor_data(temperature, humidity, source="FALLBACK"):
+    """Update sensor data (bisa dari MQTT atau fallback)"""
+    # Determine status
+    if temperature < 25:
+        status, color, code = "DINGIN 🥶", "#3B82F6", 0
+    elif temperature > 28:
+        status, color, code = "PANAS 🔥", "#EF4444", 2
+    else:
+        status, color, code = "NORMAL ✅", "#10B981", 1
+    
+    # Update state
+    st.session_state.iot_dashboard.update({
+        "temperature": temperature,
+        "humidity": humidity,
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "status": status,
+        "status_code": code,
+        "data_points": st.session_state.iot_dashboard["data_points"] + 1,
+        "last_update": datetime.now()
+    })
+    
+    # Add to history
+    st.session_state.iot_dashboard["sensor_history"].append({
+        "timestamp": datetime.now(),
+        "temperature": temperature,
+        "humidity": humidity,
+        "status": status,
+        "color": color,
+        "source": source
+    })
+    
+    # Keep only last 100 records
+    if len(st.session_state.iot_dashboard["sensor_history"]) > 100:
+        st.session_state.iot_dashboard["sensor_history"] = st.session_state.iot_dashboard["sensor_history"][-100:]
+    
+    # Add to ML training data
+    st.session_state.iot_dashboard["ml_training_data"].append({
+        "temperature": temperature,
+        "humidity": humidity,
+        "status_code": code
+    })
+    
+    # Make ML predictions
+    if st.session_state.iot_dashboard["ml_trained"]:
+        predictions = st.session_state.ml_system.predict(temperature, humidity)
+        st.session_state.iot_dashboard["ml_predictions"] = predictions
+    
+    log_message(f"{source}: {temperature:.1f}°C, {humidity:.1f}% → {status}", "SENSOR")
+
+# ==================== AUTO-UPDATE THREAD ====================
+def fallback_update_thread():
+    """Thread untuk update data fallback"""
+    while st.session_state.iot_dashboard.get("fallback_mode", False):
+        if not st.session_state.iot_dashboard["mqtt_connected"]:
+            # Generate fallback data
+            temp, hum, status, color, code = generate_fallback_data()
+            update_sensor_data(temp, hum, "FALLBACK")
+        
+        time.sleep(3)  # Update every 3 seconds
 
 # ==================== STREAMLIT UI ====================
 def main():
     st.set_page_config(
-        page_title="ESP32 IoT Dashboard Pro",
-        page_icon="🤖",
+        page_title="IoT Dashboard Ultimate",
+        page_icon="🚀",
         layout="wide",
         initial_sidebar_state="expanded"
     )
@@ -567,22 +507,22 @@ def main():
     # Custom CSS
     st.markdown("""
     <style>
-    .metric-card {
+    .dashboard-card {
         background: white;
         padding: 1.5rem;
         border-radius: 15px;
         border-left: 6px solid;
-        box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+        box-shadow: 0 5px 20px rgba(0,0,0,0.08);
         margin-bottom: 1rem;
         transition: all 0.3s ease;
     }
     
-    .metric-card:hover {
+    .dashboard-card:hover {
         transform: translateY(-2px);
         box-shadow: 0 8px 25px rgba(0,0,0,0.12);
     }
     
-    .ml-model-card {
+    .model-card {
         background: white;
         padding: 1.2rem;
         border-radius: 10px;
@@ -591,12 +531,12 @@ def main():
         transition: all 0.3s ease;
     }
     
-    .ml-model-card:hover {
+    .model-card:hover {
         border-color: #3B82F6;
-        box-shadow: 0 5px 15px rgba(59, 130, 246, 0.1);
+        box-shadow: 0 5px 15px rgba(59,130,246,0.1);
     }
     
-    .connection-status {
+    .status-badge {
         padding: 0.5rem 1rem;
         border-radius: 20px;
         font-weight: bold;
@@ -604,20 +544,19 @@ def main():
         display: inline-block;
     }
     
-    .connected { background: #D1FAE5; color: #065F46; border: 1px solid #A7F3D0; }
-    .connecting { background: #FEF3C7; color: #92400E; border: 1px solid #FDE68A; }
-    .disconnected { background: #FEE2E2; color: #991B1B; border: 1px solid #FECACA; }
-    .error { background: #FEE2E2; color: #991B1B; border: 1px solid #FECACA; }
+    .connected { background: #10B981; color: white; }
+    .disconnected { background: #EF4444; color: white; }
+    .fallback { background: #F59E0B; color: white; }
     
-    .log-entry {
+    .log-item {
         padding: 0.5rem;
         border-bottom: 1px solid #E5E7EB;
         font-family: 'Courier New', monospace;
         font-size: 0.85rem;
     }
     
-    .data-value {
-        font-size: 2.5rem;
+    .big-number {
+        font-size: 2.8rem;
         font-weight: bold;
         margin: 0.5rem 0;
     }
@@ -632,9 +571,14 @@ def main():
         100% { opacity: 1; }
     }
     
-    .tab-content {
-        padding: 1rem 0;
+    .connection-test-result {
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 1rem 0;
     }
+    
+    .success { background: #D1FAE5; border: 1px solid #A7F3D0; color: #065F46; }
+    .error { background: #FEE2E2; border: 1px solid #FECACA; color: #991B1B; }
     </style>
     """, unsafe_allow_html=True)
     
@@ -648,79 +592,97 @@ def main():
         margin-bottom: 2rem;
         text-align: center;
     ">
-        <h1 style="margin: 0; font-size: 2.8rem;">🤖 ESP32 SMART DASHBOARD</h1>
-        <p style="font-size: 1.2rem; opacity: 0.9;">Real-time IoT + KNN • Decision Tree • Logistic Regression</p>
+        <h1 style="margin: 0; font-size: 2.8rem;">🚀 ULTIMATE IOT DASHBOARD</h1>
+        <p style="font-size: 1.2rem; opacity: 0.9;">Real-time • ML Ready • Connection Test • Fallback Mode</p>
     </div>
     """, unsafe_allow_html=True)
     
     # Sidebar
     with st.sidebar:
-        st.header("🔗 Connection Control")
+        st.header("🔗 Connection Manager")
         
-        # Connection status
-        status = st.session_state.app_state["connection_status"]
-        status_display = {
-            "connected": ("🟢 CONNECTED", "connected"),
-            "connecting": ("🟡 CONNECTING", "connecting"),
-            "disconnected": ("🔴 DISCONNECTED", "disconnected"),
-            "error": ("🔴 ERROR", "error")
-        }.get(status, ("⚪ UNKNOWN", "disconnected"))
-        
-        col_status, col_info = st.columns([2, 1])
+        # Status display
+        col_status, col_mode = st.columns(2)
         with col_status:
-            st.markdown(f'<div class="connection-status {status_display[1]}">{status_display[0]}</div>', unsafe_allow_html=True)
-        with col_info:
-            st.caption(f"Data: {st.session_state.app_state['data_points']}")
+            if st.session_state.iot_dashboard["mqtt_connected"]:
+                st.markdown('<div class="status-badge connected">🟢 CONNECTED</div>', unsafe_allow_html=True)
+            elif st.session_state.iot_dashboard.get("fallback_mode", False):
+                st.markdown('<div class="status-badge fallback">🟡 FALLBACK</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="status-badge disconnected">🔴 DISCONNECTED</div>', unsafe_allow_html=True)
         
-        # Connection buttons
-        if not st.session_state.app_state["mqtt_connected"]:
-            if st.button("🔗 Connect to ESP32", type="primary", use_container_width=True):
-                with st.spinner("Connecting to HiveMQ..."):
-                    if st.session_state.mqtt_manager.connect_mqtt():
-                        st.success("Connected successfully!")
+        with col_mode:
+            st.caption(f"Data: {st.session_state.iot_dashboard['data_points']}")
+        
+        # Connection Test Section
+        st.subheader("🧪 Connection Test")
+        
+        test_config = st.selectbox(
+            "Test Configuration",
+            options=MQTT_TEST_CONFIGS,
+            format_func=lambda x: x["name"]
+        )
+        
+        if st.button("🔍 Test Connection", use_container_width=True):
+            with st.spinner("Testing connection..."):
+                success, message = test_mqtt_connection(test_config)
+                
+                if success:
+                    st.markdown(f"""
+                    <div class="connection-test-result success">
+                        ✅ <strong>SUCCESS</strong><br>
+                        {message}
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div class="connection-test-result error">
+                        ❌ <strong>FAILED</strong><br>
+                        {message}
+                    </div>
+                    """, unsafe_allow_html=True)
+        
+        # Connect Button
+        if not st.session_state.iot_dashboard["mqtt_connected"]:
+            if st.button("🔗 Connect with Selected Config", type="primary", use_container_width=True):
+                with st.spinner("Connecting..."):
+                    success, message = st.session_state.mqtt_manager.connect(test_config)
+                    if success:
+                        st.success("Connected!")
                         time.sleep(1)
                         st.rerun()
                     else:
-                        st.error("Connection failed. Check credentials.")
+                        st.error(f"Failed: {message}")
+                        
+                        # Offer fallback mode
+                        if st.button("🔄 Enable Fallback Mode", use_container_width=True):
+                            st.session_state.iot_dashboard["fallback_mode"] = True
+                            # Start fallback thread
+                            threading.Thread(target=fallback_update_thread, daemon=True).start()
+                            st.success("Fallback mode activated!")
+                            st.rerun()
         else:
-            if st.button("🔌 Disconnect", type="secondary", use_container_width=True):
-                if st.session_state.mqtt_manager.disconnect_mqtt():
-                    st.warning("Disconnected")
-                    time.sleep(1)
-                    st.rerun()
-        
-        # Connection details expander
-        with st.expander("🔍 Connection Details"):
-            st.write(f"**Broker:** `{MQTT_CONFIG['broker']}`")
-            st.write(f"**Port:** `{MQTT_CONFIG['port']}`")
-            st.write(f"**Username:** `{MQTT_CONFIG['username']}`")
-            st.write(f"**Topic:** `{DHT_TOPIC}`")
-            st.write(f"**Reconnect attempts:** {st.session_state.app_state['reconnect_count']}")
-            
-            if st.session_state.app_state["connection_errors"]:
-                st.write("**Recent Errors:**")
-                for error in st.session_state.app_state["connection_errors"][-3:]:
-                    st.error(f"{error['time'].strftime('%H:%M:%S')}: {error['error'][:50]}...")
+            if st.button("🔌 Disconnect", use_container_width=True):
+                st.session_state.mqtt_manager.disconnect()
+                st.warning("Disconnected")
+                time.sleep(1)
+                st.rerun()
         
         st.markdown("---")
         
-        # ML Control Section
-        st.header("🤖 ML System Control")
+        # ML Control
+        st.header("🤖 ML Control")
         
-        # ML Status
-        if st.session_state.app_state["ml_trained"]:
-            st.success(f"✅ {len([m for m in st.session_state.ml_system.models.values() if m is not None])} models trained")
-        else:
-            st.warning("⚠️ Models not trained")
+        train_data_count = len(st.session_state.iot_dashboard["ml_training_data"])
         
-        # Train ML button
-        train_samples = len(st.session_state.app_state["ml_training_data"])
-        if st.button(f"🏋️ Train ML Models ({train_samples} samples)", 
+        if st.button(f"🏋️ Train ML Models ({train_data_count} samples)", 
                     type="secondary", 
                     use_container_width=True,
-                    disabled=train_samples < 10):
+                    disabled=train_data_count < 10):
             with st.spinner("Training KNN, DT, LR..."):
-                success, message = st.session_state.ml_system.train_all_models()
+                success, message = st.session_state.ml_system.train_models(
+                    st.session_state.iot_dashboard["ml_training_data"]
+                )
                 if success:
                     st.success(message)
                 else:
@@ -728,229 +690,219 @@ def main():
                 time.sleep(2)
                 st.rerun()
         
-        # Manual prediction test
+        # Manual Prediction Test
         st.markdown("---")
         st.subheader("🧪 Test Prediction")
         
         col_temp, col_hum = st.columns(2)
         with col_temp:
-            test_temp = st.number_input("Temp (°C)", 15.0, 35.0, 25.0, 0.5)
+            test_temp = st.slider("Temperature (°C)", 15.0, 35.0, 25.0, 0.5)
         with col_hum:
-            test_hum = st.number_input("Hum (%)", 30.0, 90.0, 65.0, 1.0)
+            test_hum = st.slider("Humidity (%)", 30.0, 90.0, 65.0, 1.0)
         
-        if st.button("🔮 Predict with ML", use_container_width=True,
-                    disabled=not st.session_state.app_state["ml_trained"]):
-            predictions = st.session_state.ml_system.predict_all(test_temp, test_hum)
-            if predictions:
-                st.session_state.app_state["ml_predictions"] = predictions
-                st.success("Predictions generated!")
-                st.rerun()
-            else:
-                st.warning("No predictions available")
+        if st.button("🔮 Predict", use_container_width=True,
+                    disabled=not st.session_state.iot_dashboard["ml_trained"]):
+            predictions = st.session_state.ml_system.predict(test_temp, test_hum)
+            st.session_state.iot_dashboard["ml_predictions"] = predictions
+            st.success("Predictions generated!")
+            st.rerun()
         
         st.markdown("---")
         
-        # LED Control
+        # LED Control (only if connected)
         st.header("💡 LED Control")
         
         col_led1, col_led2 = st.columns(2)
         with col_led1:
             if st.button("🔴 RED", use_container_width=True,
-                        disabled=not st.session_state.app_state["mqtt_connected"]):
+                        disabled=not st.session_state.iot_dashboard["mqtt_connected"]):
                 st.session_state.mqtt_manager.send_led_command("merah")
-                st.success("Sent: RED")
+                st.success("Sent RED")
             
             if st.button("🟢 GREEN", use_container_width=True,
-                        disabled=not st.session_state.app_state["mqtt_connected"]):
+                        disabled=not st.session_state.iot_dashboard["mqtt_connected"]):
                 st.session_state.mqtt_manager.send_led_command("hijau")
-                st.success("Sent: GREEN")
+                st.success("Sent GREEN")
         
         with col_led2:
             if st.button("🟡 YELLOW", use_container_width=True,
-                        disabled=not st.session_state.app_state["mqtt_connected"]):
+                        disabled=not st.session_state.iot_dashboard["mqtt_connected"]):
                 st.session_state.mqtt_manager.send_led_command("kuning")
-                st.success("Sent: YELLOW")
+                st.success("Sent YELLOW")
             
             if st.button("⚫ OFF", use_container_width=True,
-                        disabled=not st.session_state.app_state["mqtt_connected"]):
+                        disabled=not st.session_state.iot_dashboard["mqtt_connected"]):
                 st.session_state.mqtt_manager.send_led_command("off")
-                st.success("Sent: OFF")
+                st.success("Sent OFF")
         
-        st.caption(f"Status: {st.session_state.app_state['led_status'].upper()}")
+        st.caption(f"LED: {st.session_state.iot_dashboard['led_status'].upper()}")
         
         st.markdown("---")
         
-        # System Controls
+        # System Control
         st.header("⚙️ System")
         
-        auto_refresh = st.checkbox("🔄 Auto-refresh (5s)", 
-                                  value=st.session_state.app_state["auto_refresh"])
-        st.session_state.app_state["auto_refresh"] = auto_refresh
+        auto_refresh = st.checkbox("🔄 Auto-refresh (3s)", 
+                                  value=st.session_state.iot_dashboard["auto_refresh"])
+        st.session_state.iot_dashboard["auto_refresh"] = auto_refresh
         
         if st.button("🔄 Refresh Now", use_container_width=True):
             st.rerun()
         
         if st.button("🗑️ Clear Logs", use_container_width=True):
-            st.session_state.app_state["system_logs"] = []
+            st.session_state.iot_dashboard["logs"] = []
             st.rerun()
     
     # ============ MAIN DASHBOARD ============
     
-    # Row 1: Live Sensor Data
+    # Row 1: Live Data
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        temp = st.session_state.app_state["temperature"]
+        temp = st.session_state.iot_dashboard["temperature"]
         temp_color = "#3B82F6" if temp < 25 else "#EF4444" if temp > 28 else "#10B981"
         
         st.markdown(f"""
-        <div class="metric-card" style="border-left-color: {temp_color};">
+        <div class="dashboard-card" style="border-left-color: {temp_color};">
             <h3 style="color: #6B7280; margin: 0 0 0.5rem 0;">🌡️ TEMPERATURE</h3>
-            <div class="data-value pulse" style="color: {temp_color};">
+            <div class="big-number pulse" style="color: {temp_color};">
                 {temp:.1f}°C
             </div>
             <p style="color: #9CA3AF; margin: 0; font-size: 0.9rem;">
-                {st.session_state.app_state['timestamp']}
+                {st.session_state.iot_dashboard['timestamp']}
             </p>
         </div>
         """, unsafe_allow_html=True)
     
     with col2:
-        hum = st.session_state.app_state["humidity"]
+        hum = st.session_state.iot_dashboard["humidity"]
         hum_color = "#3B82F6"
         
         st.markdown(f"""
-        <div class="metric-card" style="border-left-color: {hum_color};">
+        <div class="dashboard-card" style="border-left-color: {hum_color};">
             <h3 style="color: #6B7280; margin: 0 0 0.5rem 0;">💧 HUMIDITY</h3>
-            <div class="data-value pulse" style="color: {hum_color};">
+            <div class="big-number pulse" style="color: {hum_color};">
                 {hum:.1f}%
             </div>
             <p style="color: #9CA3AF; margin: 0; font-size: 0.9rem;">
-                {st.session_state.app_state['timestamp']}
+                {st.session_state.iot_dashboard['timestamp']}
             </p>
         </div>
         """, unsafe_allow_html=True)
     
     with col3:
-        status = st.session_state.app_state["status"]
+        status = st.session_state.iot_dashboard["status"]
         status_color = "#3B82F6" if "DINGIN" in status else "#EF4444" if "PANAS" in status else "#10B981"
         
         st.markdown(f"""
-        <div class="metric-card" style="border-left-color: {status_color};">
+        <div class="dashboard-card" style="border-left-color: {status_color};">
             <h3 style="color: #6B7280; margin: 0 0 0.5rem 0;">🏷️ ROOM STATUS</h3>
-            <div class="data-value" style="color: {status_color}; font-size: 2rem;">
+            <div class="big-number" style="color: {status_color}; font-size: 2rem;">
                 {status}
             </div>
             <p style="color: #9CA3AF; margin: 0; font-size: 0.9rem;">
-                Auto-classified
+                Based on temperature
             </p>
         </div>
         """, unsafe_allow_html=True)
     
     with col4:
-        ml_status = "✅ TRAINED" if st.session_state.app_state["ml_trained"] else "⚠️ NOT TRAINED"
-        ml_color = "#10B981" if st.session_state.app_state["ml_trained"] else "#F59E0B"
-        trained_count = len([m for m in st.session_state.ml_system.models.values() if m is not None])
+        ml_status = "TRAINED" if st.session_state.iot_dashboard["ml_trained"] else "NOT TRAINED"
+        ml_color = "#10B981" if st.session_state.iot_dashboard["ml_trained"] else "#F59E0B"
+        ml_icon = "✅" if st.session_state.iot_dashboard["ml_trained"] else "⚠️"
         
         st.markdown(f"""
-        <div class="metric-card" style="border-left-color: {ml_color};">
+        <div class="dashboard-card" style="border-left-color: {ml_color};">
             <h3 style="color: #6B7280; margin: 0 0 0.5rem 0;">🤖 ML STATUS</h3>
-            <div class="data-value" style="color: {ml_color}; font-size: 1.8rem;">
-                {ml_status}
+            <div class="big-number" style="color: {ml_color}; font-size: 1.8rem;">
+                {ml_icon} {ml_status}
             </div>
             <p style="color: #9CA3AF; margin: 0; font-size: 0.9rem;">
-                {trained_count}/3 models ready
+                KNN • DT • LR Ready
             </p>
         </div>
         """, unsafe_allow_html=True)
     
     st.markdown("---")
     
-    # Row 2: ML Predictions Display
+    # Row 2: ML Predictions
     st.subheader("🔮 ML Model Predictions")
     
-    if st.session_state.app_state["ml_predictions"]:
+    if st.session_state.iot_dashboard["ml_predictions"]:
+        predictions = st.session_state.iot_dashboard["ml_predictions"]
+        
         col_knn, col_dt, col_lr = st.columns(3)
         
-        predictions = st.session_state.app_state["ml_predictions"]
-        
-        # KNN Prediction
+        # KNN
         with col_knn:
             if "KNN" in predictions:
                 pred = predictions["KNN"]
-                color = "#3B82F6" if pred["label"] == "DINGIN" else "#EF4444" if pred["label"] == "PANAS" else "#10B981"
+                color = "#3B82F6" if "DINGIN" in pred["label"] else "#EF4444" if "PANAS" in pred["label"] else "#10B981"
                 
                 st.markdown(f"""
-                <div class="ml-model-card">
-                    <h4 style="color: {color}; margin: 0 0 0.5rem 0;">K-Nearest Neighbors</h4>
+                <div class="model-card">
+                    <h4 style="color: {color};">K-Nearest Neighbors</h4>
                     <h2 style="color: {color}; margin: 0.5rem 0;">{pred['label']}</h2>
-                    <p style="font-weight: bold; color: #6B7280;">
-                        Confidence: {pred['confidence']:.1%}
-                    </p>
-                    <div style="background: #F3F4F6; padding: 0.5rem; border-radius: 5px; margin-top: 0.5rem;">
-                        <small>🥶 DINGIN: {pred['probabilities']['DINGIN']:.1%}</small><br>
-                        <small>✅ NORMAL: {pred['probabilities']['NORMAL']:.1%}</small><br>
-                        <small>🔥 PANAS: {pred['probabilities']['PANAS']:.1%}</small>
+                    <p><strong>Confidence:</strong> {pred['confidence']:.1%}</p>
+                    <div style="background: #F3F4F6; padding: 0.5rem; border-radius: 5px;">
+                        <small>🥶: {pred['probabilities']['DINGIN']:.1%}</small><br>
+                        <small>✅: {pred['probabilities']['NORMAL']:.1%}</small><br>
+                        <small>🔥: {pred['probabilities']['PANAS']:.1%}</small>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
         
-        # Decision Tree Prediction
+        # Decision Tree
         with col_dt:
             if "Decision Tree" in predictions:
                 pred = predictions["Decision Tree"]
-                color = "#3B82F6" if pred["label"] == "DINGIN" else "#EF4444" if pred["label"] == "PANAS" else "#10B981"
+                color = "#3B82F6" if "DINGIN" in pred["label"] else "#EF4444" if "PANAS" in pred["label"] else "#10B981"
                 
                 st.markdown(f"""
-                <div class="ml-model-card">
-                    <h4 style="color: {color}; margin: 0 0 0.5rem 0;">Decision Tree</h4>
+                <div class="model-card">
+                    <h4 style="color: {color};">Decision Tree</h4>
                     <h2 style="color: {color}; margin: 0.5rem 0;">{pred['label']}</h2>
-                    <p style="font-weight: bold; color: #6B7280;">
-                        Confidence: {pred['confidence']:.1%}
-                    </p>
-                    <div style="background: #F3F4F6; padding: 0.5rem; border-radius: 5px; margin-top: 0.5rem;">
-                        <small>🥶 DINGIN: {pred['probabilities']['DINGIN']:.1%}</small><br>
-                        <small>✅ NORMAL: {pred['probabilities']['NORMAL']:.1%}</small><br>
-                        <small>🔥 PANAS: {pred['probabilities']['PANAS']:.1%}</small>
+                    <p><strong>Confidence:</strong> {pred['confidence']:.1%}</p>
+                    <div style="background: #F3F4F6; padding: 0.5rem; border-radius: 5px;">
+                        <small>🥶: {pred['probabilities']['DINGIN']:.1%}</small><br>
+                        <small>✅: {pred['probabilities']['NORMAL']:.1%}</small><br>
+                        <small>🔥: {pred['probabilities']['PANAS']:.1%}</small>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
         
-        # Logistic Regression Prediction
+        # Logistic Regression
         with col_lr:
             if "Logistic Regression" in predictions:
                 pred = predictions["Logistic Regression"]
-                color = "#3B82F6" if pred["label"] == "DINGIN" else "#EF4444" if pred["label"] == "PANAS" else "#10B981"
+                color = "#3B82F6" if "DINGIN" in pred["label"] else "#EF4444" if "PANAS" in pred["label"] else "#10B981"
                 
                 st.markdown(f"""
-                <div class="ml-model-card">
-                    <h4 style="color: {color}; margin: 0 0 0.5rem 0;">Logistic Regression</h4>
+                <div class="model-card">
+                    <h4 style="color: {color};">Logistic Regression</h4>
                     <h2 style="color: {color}; margin: 0.5rem 0;">{pred['label']}</h2>
-                    <p style="font-weight: bold; color: #6B7280;">
-                        Confidence: {pred['confidence']:.1%}
-                    </p>
-                    <div style="background: #F3F4F6; padding: 0.5rem; border-radius: 5px; margin-top: 0.5rem;">
-                        <small>🥶 DINGIN: {pred['probabilities']['DINGIN']:.1%}</small><br>
-                        <small>✅ NORMAL: {pred['probabilities']['NORMAL']:.1%}</small><br>
-                        <small>🔥 PANAS: {pred['probabilities']['PANAS']:.1%}</small>
+                    <p><strong>Confidence:</strong> {pred['confidence']:.1%}</p>
+                    <div style="background: #F3F4F6; padding: 0.5rem; border-radius: 5px;">
+                        <small>🥶: {pred['probabilities']['DINGIN']:.1%}</small><br>
+                        <small>✅: {pred['probabilities']['NORMAL']:.1%}</small><br>
+                        <small>🔥: {pred['probabilities']['PANAS']:.1%}</small>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
     else:
-        if st.session_state.app_state["ml_trained"]:
-            st.info("⏳ Waiting for data to make predictions")
+        if st.session_state.iot_dashboard["ml_trained"]:
+            st.info("⏳ No predictions yet. Waiting for data...")
         else:
             st.warning("🤖 Train ML models first to enable predictions")
     
     st.markdown("---")
     
-    # Row 3: Tabs for Charts, Data, and ML Performance
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Charts", "📊 ML Performance", "📋 Data History", "📝 System Logs"])
+    # Row 3: Tabs
+    tab1, tab2, tab3 = st.tabs(["📈 Charts", "📋 History", "📝 Logs"])
     
     with tab1:
-        # Charts Tab
-        if len(st.session_state.app_state["sensor_history"]) > 1:
-            history_df = pd.DataFrame(st.session_state.app_state["sensor_history"])
+        if len(st.session_state.iot_dashboard["sensor_history"]) > 1:
+            history_df = pd.DataFrame(st.session_state.iot_dashboard["sensor_history"])
             
             col_chart1, col_chart2 = st.columns(2)
             
@@ -960,13 +912,10 @@ def main():
                     x='timestamp', 
                     y='temperature',
                     title='Temperature Trend',
-                    labels={'temperature': 'Temperature (°C)', 'timestamp': 'Time'}
+                    color_discrete_sequence=['#EF4444']
                 )
-                fig_temp.update_traces(line_color='#EF4444', line_width=3)
-                fig_temp.add_hline(y=25, line_dash="dash", line_color="#3B82F6", 
-                                 annotation_text="DINGIN (<25°C)")
-                fig_temp.add_hline(y=28, line_dash="dash", line_color="#EF4444",
-                                 annotation_text="PANAS (>28°C)")
+                fig_temp.add_hline(y=25, line_dash="dash", line_color="#3B82F6")
+                fig_temp.add_hline(y=28, line_dash="dash", line_color="#EF4444")
                 st.plotly_chart(fig_temp, use_container_width=True)
             
             with col_chart2:
@@ -975,114 +924,38 @@ def main():
                     x='timestamp',
                     y='humidity',
                     title='Humidity Trend',
-                    labels={'humidity': 'Humidity (%)', 'timestamp': 'Time'}
+                    color_discrete_sequence=['#3B82F6']
                 )
-                fig_hum.update_traces(line_color='#3B82F6', line_width=3)
                 st.plotly_chart(fig_hum, use_container_width=True)
         else:
-            st.info("📈 Connect to ESP32 to see live charts")
+            st.info("📈 Waiting for data...")
     
     with tab2:
-        # ML Performance Tab
-        if st.session_state.app_state["ml_performance"]:
-            # Accuracy chart
-            models = list(st.session_state.app_state["ml_performance"].keys())
-            accuracies = [st.session_state.app_state["ml_performance"][m]["accuracy"] for m in models]
-            
-            fig_acc = go.Figure(data=[
-                go.Bar(
-                    x=models,
-                    y=accuracies,
-                    marker_color=['#3B82F6', '#10B981', '#F59E0B'],
-                    text=[f"{acc:.1%}" for acc in accuracies],
-                    textposition='auto'
-                )
-            ])
-            
-            fig_acc.update_layout(
-                title='Model Accuracy Comparison',
-                yaxis_title='Accuracy',
-                yaxis_range=[0, 1],
-                height=300
-            )
-            
-            st.plotly_chart(fig_acc, use_container_width=True)
-            
-            # Confusion matrices
-            st.subheader("Confusion Matrices")
-            col_cm1, col_cm2, col_cm3 = st.columns(3)
-            
-            for idx, model_name in enumerate(models):
-                with [col_cm1, col_cm2, col_cm3][idx]:
-                    info = st.session_state.app_state["ml_performance"][model_name]
-                    cm = confusion_matrix(info["y_test"], info["y_pred"])
-                    
-                    fig_cm = px.imshow(
-                        cm,
-                        text_auto=True,
-                        color_continuous_scale='Blues',
-                        title=f'{model_name}',
-                        labels=dict(x="Predicted", y="Actual", color="Count")
-                    )
-                    
-                    fig_cm.update_layout(height=250)
-                    st.plotly_chart(fig_cm, use_container_width=True)
+        if st.session_state.iot_dashboard["sensor_history"]:
+            df = pd.DataFrame(st.session_state.iot_dashboard["sensor_history"][-20:])
+            df['timestamp'] = df['timestamp'].dt.strftime('%H:%M:%S')
+            st.dataframe(df[['timestamp', 'temperature', 'humidity', 'status', 'source']], 
+                        use_container_width=True)
         else:
-            st.info("📊 Train ML models to see performance metrics")
+            st.info("📋 No data history yet")
     
     with tab3:
-        # Data History Tab
-        if st.session_state.app_state["csv_records"]:
-            df = pd.DataFrame(st.session_state.app_state["csv_records"])
-            
-            # Style the dataframe
-            def color_status(val):
-                if val == 'DINGIN':
-                    return 'background-color: #DBEAFE; color: #1E40AF;'
-                elif val == 'PANAS':
-                    return 'background-color: #FEE2E2; color: #991B1B;'
-                else:
-                    return 'background-color: #D1FAE5; color: #065F46;'
-            
-            styled_df = df.style.applymap(color_status, subset=['status'])
-            
-            st.dataframe(styled_df, use_container_width=True, height=300)
-            
-            # Download button
-            if st.button("📥 Download CSV Data", use_container_width=True):
-                csv_file = "iot_data.csv"
-                if os.path.exists(csv_file):
-                    with open(csv_file, 'r') as f:
-                        csv_data = f.read()
-                    
-                    st.download_button(
-                        label="Click to Download",
-                        data=csv_data,
-                        file_name=f"iot_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-        else:
-            st.info("📋 No data collected yet")
-    
-    with tab4:
-        # System Logs Tab
         log_container = st.container(height=400)
         
         with log_container:
-            for log in st.session_state.app_state["system_logs"][:30]:
+            for log in st.session_state.iot_dashboard["logs"][:30]:
                 st.markdown(f"""
-                <div style="color: {log['color']}; font-family: 'Courier New', monospace; 
+                <div style="color: {log['color']}; font-family: 'Courier New'; 
                          font-size: 0.85rem; padding: 0.3rem 0; border-bottom: 1px solid #E5E7EB;">
-                    {log['icon']} <strong>[{log['timestamp']}]</strong> {log['message']}
+                    {log['icon']} <strong>[{log['time']}]</strong> {log['message']}
                 </div>
                 """, unsafe_allow_html=True)
     
     # Auto-refresh
-    if st.session_state.app_state["auto_refresh"] and st.session_state.app_state["mqtt_connected"]:
-        time.sleep(5)
+    if st.session_state.iot_dashboard["auto_refresh"]:
+        time.sleep(3)
         st.rerun()
 
-# ==================== RUN APPLICATION ====================
+# ==================== RUN ====================
 if __name__ == "__main__":
     main()
