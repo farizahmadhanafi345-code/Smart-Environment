@@ -19,8 +19,8 @@ warnings.filterwarnings('ignore')
 MQTT_CONFIG = {
     "broker": "f44c5a09b28447449642c2c62b63bba7.s1.eu.hivemq.cloud",
     "port": 8883,
-    "username": "hivemq.webclient.1760514170127",
-    "password": "0r8ULyh9&duT1,BHg%.M",
+    "username": "hivemq.webclient.1764923408610",
+    "password": "9y&f74G1*pWSD.tQdXa@",
     "use_ssl": True,
     "keepalive": 20   # <-- keepalive lebih kecil agar tidak cepat disconnect
 }
@@ -824,3 +824,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
