@@ -1,880 +1,790 @@
-# dashboard_iot_complete.py
+# dashboard_real_iot.py
 import streamlit as st
+import paho.mqtt.client as mqtt
+import json
+import time
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
-import json
-import pickle
 import os
-import time
-import paho.mqtt.client as mqtt
 import ssl
 import threading
 import warnings
-from plotly.subplots import make_subplots
 warnings.filterwarnings('ignore')
 
-# ==================== KONFIGURASI ====================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "IoT_Dataset")
-CSV_FILE = os.path.join(DATA_DIR, "sensor_data.csv")
-MODELS_DIR = os.path.join(DATA_DIR, "ml_models")
-
-# Konfigurasi HiveMQ REAL
+# ==================== KONFIGURASI REAL HIVEMQ ANDA ====================
 MQTT_CONFIG = {
     "broker": "f44c5a09b28447449642c2c62b63bba7.s1.eu.hivemq.cloud",
     "port": 8883,
-    "username": "hivemq.webclient.1764923408610",
-    "password": "9y&f74G1*pWSD.tQdXa@",
+    "username": "hivemq.webclient.1760514170127",
+    "password": "0r8ULyh9&duT1,BHg%.M",
     "use_ssl": True,
     "keepalive": 20
 }
 
-# Topics REAL
+# Topics REAL dari ESP32 Anda
 DHT_TOPIC = "sic/dibimbing/kelompok-SENSOR/FARIZ/pub/dht"
 LED_TOPIC = "sic/dibimbing/kelompok-SENSOR/FARIZ/sub/led"
 
-# ==================== SETUP PAGE ====================
-st.set_page_config(
-    page_title="IoT Smart Dashboard",
-    page_icon="🌡️",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ==================== INISIALISASI STATE GLOBAL ====================
+if 'iot_system' not in st.session_state:
+    st.session_state.iot_system = {
+        # Sensor Data
+        "temperature": 0.0,
+        "humidity": 0.0,
+        "timestamp": "",
+        "label": "WAITING",
+        "label_encoded": -1,
+        "last_update": None,
+        
+        # MQTT Status
+        "mqtt_connected": False,
+        "data_received": False,
+        "connection_attempts": 0,
+        
+        # LED Control
+        "led_status": "off",
+        "led_mode": "auto",  # auto, manual, ai
+        
+        # Data History
+        "data_points": 0,
+        "uptime": datetime.now(),
+        
+        # System Logs
+        "system_logs": []
+    }
 
-# Custom CSS
-st.markdown("""
-<style>
-    /* Main container styling */
-    .main-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 2rem;
-        border-radius: 15px;
-        text-align: center;
-        margin-bottom: 2rem;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+if 'data_history' not in st.session_state:
+    st.session_state.data_history = {
+        "timestamps": [],
+        "temperatures": [],
+        "humidities": [],
+        "labels": [],
+        "led_commands": []
+    }
+
+if 'mqtt_client' not in st.session_state:
+    st.session_state.mqtt_client = None
+
+# ==================== FUNGSI UTILITAS ====================
+def add_system_log(message, type="info"):
+    """Tambahkan log ke sistem dengan timestamp"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    icons = {
+        "info": "ℹ️",
+        "success": "✅",
+        "warning": "⚠️",
+        "error": "❌",
+        "mqtt": "📡",
+        "sensor": "🌡️",
+        "led": "💡"
     }
     
-    .metric-card {
-        background: white;
-        padding: 1.5rem;
+    icon = icons.get(type, "📝")
+    log_entry = f"[{timestamp}] {icon} {message}"
+    
+    st.session_state.iot_system["system_logs"].insert(0, log_entry)
+    
+    # Batasi jumlah log
+    if len(st.session_state.iot_system["system_logs"]) > 50:
+        st.session_state.iot_system["system_logs"] = st.session_state.iot_system["system_logs"][:50]
+    
+    # Print ke console untuk debugging
+    print(log_entry)
+
+def determine_label(temperature):
+    """Tentukan label berdasarkan suhu REAL (sesuai ESP32 Anda)"""
+    # SESUAI DENGAN KODE ESP32 ANDA: <22°C = DINGIN, 22-25°C = NORMAL, >25°C = PANAS
+    if temperature < 22:
+        return "DINGIN 🥶", 0
+    elif temperature > 25:
+        return "PANAS 🔥", 2
+    else:
+        return "NORMAL ✅", 1
+
+def calculate_uptime():
+    """Hitung waktu system telah berjalan"""
+    if st.session_state.iot_system["uptime"]:
+        uptime = datetime.now() - st.session_state.iot_system["uptime"]
+        hours = uptime.seconds // 3600
+        minutes = (uptime.seconds % 3600) // 60
+        seconds = uptime.seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return "00:00:00"
+
+# ==================== MQTT FUNCTIONS (REAL CONNECTION) ====================
+def on_mqtt_connect(client, userdata, flags, rc):
+    """Callback ketika BERHASIL terhubung ke HiveMQ REAL"""
+    if rc == 0:
+        st.session_state.iot_system["mqtt_connected"] = True
+        st.session_state.iot_system["connection_attempts"] = 0
+        
+        # Subscribe ke topic sensor REAL
+        client.subscribe(DHT_TOPIC)
+        add_system_log(f"Connected to HiveMQ Cloud", "success")
+        add_system_log(f"Subscribed to: {DHT_TOPIC}", "mqtt")
+        
+        # Publish connection status
+        connect_msg = {
+            "device": "dashboard",
+            "status": "connected",
+            "timestamp": datetime.now().isoformat()
+        }
+        client.publish("dashboard/status", json.dumps(connect_msg))
+        
+    else:
+        st.session_state.iot_system["mqtt_connected"] = False
+        error_msgs = {
+            1: "Unacceptable protocol version",
+            2: "Identifier rejected",
+            3: "Server unavailable",
+            4: "Bad username or password",
+            5: "Not authorized"
+        }
+        error_msg = error_msgs.get(rc, f"Unknown error {rc}")
+        add_system_log(f"Connection failed: {error_msg}", "error")
+
+def on_mqtt_disconnect(client, userdata, rc):
+    """Callback ketika terputus dari MQTT"""
+    st.session_state.iot_system["mqtt_connected"] = False
+    add_system_log("Disconnected from HiveMQ", "warning")
+    
+    # Attempt reconnect in background thread
+    if rc != 0:
+        threading.Thread(target=reconnect_mqtt, daemon=True).start()
+
+def on_mqtt_message(client, userdata, msg):
+    """Callback ketika menerima data REAL dari ESP32"""
+    try:
+        # Parse JSON dari ESP32 REAL
+        payload = msg.payload.decode('utf-8')
+        data = json.loads(payload)
+        
+        # Ekstrak data sensor REAL
+        temperature = float(data.get('temperature', 0))
+        humidity = float(data.get('humidity', 0))
+        sensor_type = data.get('sensor', 'DHT11')
+        
+        # Validasi data
+        if not (0 <= temperature <= 50) or not (0 <= humidity <= 100):
+            add_system_log(f"Invalid sensor data: {temperature}°C, {humidity}%", "warning")
+            return
+        
+        # Update system state
+        current_time = datetime.now()
+        
+        # Tentukan label
+        label, label_encoded = determine_label(temperature)
+        
+        # Update sensor data
+        st.session_state.iot_system.update({
+            "temperature": temperature,
+            "humidity": humidity,
+            "timestamp": current_time.strftime("%H:%M:%S"),
+            "last_update": current_time,
+            "label": label,
+            "label_encoded": label_encoded,
+            "data_received": True,
+            "data_points": st.session_state.iot_system["data_points"] + 1
+        })
+        
+        # Tambah ke history
+        st.session_state.data_history["timestamps"].append(current_time)
+        st.session_state.data_history["temperatures"].append(temperature)
+        st.session_state.data_history["humidities"].append(humidity)
+        st.session_state.data_history["labels"].append(label)
+        
+        # Batasi history size
+        max_history = 100
+        for key in st.session_state.data_history:
+            if len(st.session_state.data_history[key]) > max_history:
+                st.session_state.data_history[key] = st.session_state.data_history[key][-max_history:]
+        
+        # Auto LED control jika mode auto
+        if st.session_state.iot_system["led_mode"] == "auto":
+            if temperature < 22:
+                send_led_command("hijau")  # Dingin → Hijau
+            elif temperature > 25:
+                send_led_command("merah")  # Panas → Merah
+            else:
+                send_led_command("kuning")  # Normal → Kuning
+        
+        # Log data received
+        add_system_log(f"Sensor: {temperature:.1f}°C, {humidity:.1f}% → {label}", "sensor")
+        
+    except json.JSONDecodeError as e:
+        add_system_log(f"Invalid JSON from ESP32: {e}", "error")
+    except Exception as e:
+        add_system_log(f"Error processing message: {e}", "error")
+
+def reconnect_mqtt():
+    """Reconnect ke MQTT dengan exponential backoff"""
+    if st.session_state.mqtt_client:
+        attempts = st.session_state.iot_system["connection_attempts"]
+        backoff = min(2 ** attempts, 30)  # Max 30 seconds
+        
+        time.sleep(backoff)
+        st.session_state.iot_system["connection_attempts"] += 1
+        
+        try:
+            add_system_log(f"Reconnection attempt {attempts + 1}...", "warning")
+            st.session_state.mqtt_client.reconnect()
+        except:
+            pass
+
+def connect_to_hivemq():
+    """Connect ke HiveMQ Cloud REAL"""
+    try:
+        if st.session_state.mqtt_client and st.session_state.iot_system["mqtt_connected"]:
+            return True
+        
+        add_system_log("Connecting to HiveMQ Cloud...", "mqtt")
+        
+        # Create MQTT client
+        client_id = f"dashboard_{int(time.time())}"
+        client = mqtt.Client(client_id=client_id)
+        
+        # Set credentials
+        client.username_pw_set(MQTT_CONFIG["username"], MQTT_CONFIG["password"])
+        
+        # Setup SSL/TLS
+        if MQTT_CONFIG["use_ssl"]:
+            client.tls_set(tls_version=ssl.PROTOCOL_TLSv1_2)
+        
+        # Set callbacks
+        client.on_connect = on_mqtt_connect
+        client.on_disconnect = on_mqtt_disconnect
+        client.on_message = on_mqtt_message
+        
+        # Set will message
+        client.will_set("dashboard/status", json.dumps({
+            "device": "dashboard",
+            "status": "disconnected",
+            "timestamp": datetime.now().isoformat()
+        }))
+        
+        # Connect dengan timeout
+        client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], keepalive=20)
+        
+        # Start loop
+        client.loop_start()
+        
+        # Tunggu koneksi
+        for _ in range(10):  # Wait up to 5 seconds
+            if st.session_state.iot_system["mqtt_connected"]:
+                break
+            time.sleep(0.5)
+        
+        st.session_state.mqtt_client = client
+        return st.session_state.iot_system["mqtt_connected"]
+        
+    except Exception as e:
+        add_system_log(f"Connection failed: {str(e)}", "error")
+        return False
+
+def send_led_command(command):
+    """Kirim perintah ke LED ESP32 REAL"""
+    if not st.session_state.mqtt_client or not st.session_state.iot_system["mqtt_connected"]:
+        add_system_log("Cannot send LED command: MQTT not connected", "error")
+        return False
+    
+    try:
+        # Kirim perintah ke ESP32
+        st.session_state.mqtt_client.publish(LED_TOPIC, command)
+        
+        # Update LED status
+        st.session_state.iot_system["led_status"] = command
+        
+        # Simpan ke history
+        st.session_state.data_history["led_commands"].append({
+            "timestamp": datetime.now(),
+            "command": command,
+            "mode": st.session_state.iot_system["led_mode"]
+        })
+        
+        add_system_log(f"LED command sent: {command}", "led")
+        return True
+        
+    except Exception as e:
+        add_system_log(f"Failed to send LED command: {e}", "error")
+        return False
+
+# ==================== STREAMLIT UI (REAL DASHBOARD) ====================
+def main():
+    st.set_page_config(
+        page_title="IoT REAL-TIME Dashboard",
+        page_icon="🌡️",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # Custom CSS untuk dashboard REAL
+    st.markdown("""
+    <style>
+    .real-time-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 25px;
         border-radius: 15px;
+        margin-bottom: 25px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        text-align: center;
+    }
+    
+    .sensor-card {
+        background: white;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
         border-left: 6px solid;
-        box-shadow: 0 5px 15px rgba(0,0,0,0.05);
         transition: transform 0.3s ease;
         height: 100%;
     }
     
-    .metric-card:hover {
+    .sensor-card:hover {
         transform: translateY(-5px);
-        box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+        box-shadow: 0 10px 25px rgba(0,0,0,0.15);
     }
     
-    .status-indicator {
+    .sensor-value {
+        font-size: 2.8rem;
+        font-weight: bold;
+        margin: 10px 0;
+    }
+    
+    .status-connected {
+        background: #10B981;
+        color: white;
+        padding: 5px 15px;
+        border-radius: 20px;
+        font-weight: bold;
         display: inline-block;
-        width: 12px;
-        height: 12px;
-        border-radius: 50%;
-        margin-right: 8px;
     }
     
-    .status-connected { background-color: #10B981; }
-    .status-disconnected { background-color: #EF4444; }
-    .status-waiting { background-color: #F59E0B; }
-    
-    .prediction-card {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 15px;
-        border: 2px solid;
-        text-align: center;
-        box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+    .status-disconnected {
+        background: #EF4444;
+        color: white;
+        padding: 5px 15px;
+        border-radius: 20px;
+        font-weight: bold;
+        display: inline-block;
     }
     
-    .data-table {
-        background: white;
-        border-radius: 10px;
-        padding: 1rem;
-        box-shadow: 0 3px 10px rgba(0,0,0,0.05);
-    }
+    .label-dingin { color: #3B82F6; }
+    .label-normal { color: #10B981; }
+    .label-panas { color: #EF4444; }
     
     .log-container {
         background: #1F2937;
         color: #E5E7EB;
-        padding: 1rem;
+        padding: 15px;
         border-radius: 10px;
         font-family: 'Courier New', monospace;
         max-height: 300px;
         overflow-y: auto;
-        font-size: 0.9rem;
+        font-size: 0.85rem;
     }
     
-    /* Color coding for labels */
-    .label-dingin { color: #3B82F6; font-weight: bold; }
-    .label-normal { color: #10B981; font-weight: bold; }
-    .label-panas { color: #EF4444; font-weight: bold; }
+    .data-point {
+        animation: pulse 2s infinite;
+    }
     
-    /* Animation for real-time updates */
     @keyframes pulse {
         0% { opacity: 1; }
         50% { opacity: 0.7; }
         100% { opacity: 1; }
     }
     
-    .pulse {
-        animation: pulse 2s infinite;
+    .btn-led {
+        padding: 12px 20px;
+        border: none;
+        border-radius: 8px;
+        font-weight: bold;
+        font-size: 1.1rem;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        width: 100%;
+        margin-bottom: 10px;
     }
-</style>
-""", unsafe_allow_html=True)
-
-# ==================== INISIALISASI STATE ====================
-if 'sensor_data' not in st.session_state:
-    st.session_state.sensor_data = {
-        "temperature": 25.0,
-        "humidity": 65.0,
-        "timestamp": datetime.now().strftime("%H:%M:%S"),
-        "label": "NORMAL",
-        "label_encoded": 1,
-        "last_update": datetime.now()
+    
+    .btn-led:hover {
+        transform: scale(1.05);
     }
-
-if 'mqtt_client' not in st.session_state:
-    st.session_state.mqtt_client = None
-    st.session_state.mqtt_connected = False
-
-if 'data_history' not in st.session_state:
-    st.session_state.data_history = []
-
-if 'system_logs' not in st.session_state:
-    st.session_state.system_logs = []
-
-# ==================== FUNGSI MQTT ====================
-def add_log(message):
-    """Tambahkan log ke sistem"""
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    log_entry = f"[{timestamp}] {message}"
-    st.session_state.system_logs.append(log_entry)
     
-    # Batasi jumlah log
-    if len(st.session_state.system_logs) > 50:
-        st.session_state.system_logs = st.session_state.system_logs[-50:]
-
-def on_mqtt_connect(client, userdata, flags, rc):
-    """Callback ketika terhubung ke MQTT"""
-    if rc == 0:
-        st.session_state.mqtt_connected = True
-        client.subscribe(DHT_TOPIC)
-        add_log("✅ Connected to HiveMQ Cloud")
-    else:
-        st.session_state.mqtt_connected = False
-        add_log(f"❌ Connection failed with code: {rc}")
-
-def on_mqtt_disconnect(client, userdata, rc):
-    """Callback ketika terputus dari MQTT"""
-    st.session_state.mqtt_connected = False
-    add_log("⚠️ Disconnected from HiveMQ")
-
-def on_mqtt_message(client, userdata, msg):
-    """Callback ketika menerima data sensor"""
-    try:
-        data = json.loads(msg.payload.decode('utf-8'))
-        
-        temperature = float(data.get('temperature', 0))
-        humidity = float(data.get('humidity', 0))
-        
-        # Tentukan label berdasarkan suhu
-        if temperature < 25:
-            label = "DINGIN"
-            label_encoded = 0
-        elif temperature > 28:
-            label = "PANAS"
-            label_encoded = 2
-        else:
-            label = "NORMAL"
-            label_encoded = 1
-        
-        # Update sensor data
-        st.session_state.sensor_data.update({
-            "temperature": temperature,
-            "humidity": humidity,
-            "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "label": label,
-            "label_encoded": label_encoded,
-            "last_update": datetime.now()
-        })
-        
-        # Tambah ke history
-        st.session_state.data_history.append({
-            "timestamp": datetime.now(),
-            "temperature": temperature,
-            "humidity": humidity,
-            "label": label
-        })
-        
-        # Batasi history
-        if len(st.session_state.data_history) > 100:
-            st.session_state.data_history = st.session_state.data_history[-100:]
-        
-        add_log(f"📡 Received: {temperature}°C, {humidity}% → {label}")
-        
-    except Exception as e:
-        add_log(f"❌ Error processing MQTT message: {e}")
-
-def connect_mqtt():
-    """Connect ke HiveMQ Cloud"""
-    try:
-        if st.session_state.mqtt_client and st.session_state.mqtt_connected:
-            return True
-        
-        client = mqtt.Client()
-        client.username_pw_set(MQTT_CONFIG["username"], MQTT_CONFIG["password"])
-        
-        if MQTT_CONFIG["use_ssl"]:
-            client.tls_set(tls_version=ssl.PROTOCOL_TLSv1_2)
-        
-        client.on_connect = on_mqtt_connect
-        client.on_disconnect = on_mqtt_disconnect
-        client.on_message = on_mqtt_message
-        
-        client.connect(MQTT_CONFIG["broker"], MQTT_CONFIG["port"], keepalive=20)
-        client.loop_start()
-        
-        st.session_state.mqtt_client = client
-        
-        # Tunggu koneksi
-        time.sleep(2)
-        return True
-        
-    except Exception as e:
-        add_log(f"❌ MQTT Connection failed: {e}")
-        return False
-
-def send_led_command(command):
-    """Kirim perintah ke LED"""
-    if st.session_state.mqtt_client and st.session_state.mqtt_connected:
-        try:
-            st.session_state.mqtt_client.publish(LED_TOPIC, command)
-            add_log(f"💡 LED command sent: {command}")
-            return True
-        except:
-            return False
-    return False
-
-# ==================== LOAD MODELS & DATA ====================
-@st.cache_resource
-def load_ml_models():
-    """Load ML models dari file"""
-    models = {}
+    .btn-red { background: #EF4444; color: white; }
+    .btn-green { background: #10B981; color: white; }
+    .btn-yellow { background: #F59E0B; color: white; }
+    .btn-blue { background: #3B82F6; color: white; }
+    .btn-gray { background: #6B7280; color: white; }
+    </style>
+    """, unsafe_allow_html=True)
     
-    try:
-        # Load scaler
-        scaler_path = os.path.join(MODELS_DIR, "scaler.pkl")
-        if os.path.exists(scaler_path):
-            with open(scaler_path, 'rb') as f:
-                scaler = pickle.load(f)
-        else:
-            scaler = None
-            add_log("⚠️ Scaler file not found")
-        
-        # Load models
-        model_files = [
-            ('Decision Tree', 'decision_tree.pkl'),
-            ('Random Forest', 'random_forest.pkl'),
-            ('K-Nearest Neighbors', 'k_nearest_neighbors.pkl'),
-            ('Logistic Regression', 'logistic_regression.pkl')
-        ]
-        
-        for name, filename in model_files:
-            model_path = os.path.join(MODELS_DIR, filename)
-            if os.path.exists(model_path):
-                with open(model_path, 'rb') as f:
-                    models[name] = pickle.load(f)
-                add_log(f"✅ Loaded model: {name}")
-            else:
-                add_log(f"⚠️ Model not found: {filename}")
-        
-        return models, scaler
-    
-    except Exception as e:
-        add_log(f"❌ Error loading models: {e}")
-        return None, None
-
-def load_dataset():
-    """Load dataset dari CSV file"""
-    try:
-        if os.path.exists(CSV_FILE):
-            df = pd.read_csv(CSV_FILE, delimiter=';')
-            
-            # Konversi timestamp
-            if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-                df['time'] = df['timestamp'].dt.strftime('%H:%M')
-                df['date'] = df['timestamp'].dt.date
-            
-            add_log(f"📊 Dataset loaded: {len(df)} records")
-            return df
-        else:
-            add_log("📝 Dataset file not found, starting empty")
-            return pd.DataFrame()
-            
-    except Exception as e:
-        add_log(f"❌ Error loading dataset: {e}")
-        return pd.DataFrame()
-
-def predict_with_models(models, scaler, temperature, humidity, hour=None, minute=None):
-    """Prediksi dengan semua model ML"""
-    if hour is None or minute is None:
-        now = datetime.now()
-        hour = now.hour
-        minute = now.minute
-    
-    if not models or scaler is None:
-        return {}
-    
-    predictions = {}
-    
-    for model_name, model in models.items():
-        try:
-            # Prepare features
-            features = np.array([[temperature, humidity, hour, minute]])
-            features_scaled = scaler.transform(features)
-            
-            # Predict
-            pred_code = model.predict(features_scaled)[0]
-            
-            # Get probabilities
-            if hasattr(model, 'predict_proba'):
-                probs = model.predict_proba(features_scaled)[0]
-                confidence = probs[pred_code]
-            else:
-                confidence = 1.0
-                probs = [0, 0, 0]
-            
-            # Map to label
-            label_map = {0: 'DINGIN', 1: 'NORMAL', 2: 'PANAS'}
-            label = label_map.get(pred_code, 'UNKNOWN')
-            
-            predictions[model_name] = {
-                'label': label,
-                'confidence': float(confidence),
-                'probabilities': {
-                    'DINGIN': float(probs[0]) if len(probs) > 0 else 0,
-                    'NORMAL': float(probs[1]) if len(probs) > 1 else 0,
-                    'PANAS': float(probs[2]) if len(probs) > 2 else 0
-                },
-                'label_encoded': int(pred_code)
-            }
-            
-        except Exception as e:
-            predictions[model_name] = {
-                'label': 'ERROR',
-                'confidence': 0.0,
-                'error': str(e)
-            }
-    
-    return predictions
-
-# ==================== SIDEBAR ====================
-def sidebar_controls():
-    """Sidebar controls untuk dashboard"""
-    with st.sidebar:
-        st.markdown('<div class="main-header"><h3>⚙️ CONTROL PANEL</h3></div>', unsafe_allow_html=True)
-        
-        # Status koneksi
-        st.subheader("🔗 Connection Status")
-        col1, col2 = st.columns([1, 2])
-        
-        with col1:
-            if st.session_state.mqtt_connected:
-                st.markdown('<span class="status-indicator status-connected"></span> CONNECTED', unsafe_allow_html=True)
-            else:
-                st.markdown('<span class="status-indicator status-disconnected"></span> DISCONNECTED', unsafe_allow_html=True)
-        
-        with col2:
-            if st.session_state.sensor_data['timestamp']:
-                last_update = datetime.now() - st.session_state.sensor_data['last_update']
-                seconds = last_update.total_seconds()
-                if seconds < 10:
-                    st.success("LIVE")
-                elif seconds < 60:
-                    st.warning(f"{int(seconds)}s ago")
-                else:
-                    st.error(f"{int(seconds/60)}m ago")
-        
-        # Kontrol koneksi
-        st.subheader("🌐 MQTT Control")
-        col_conn1, col_conn2 = st.columns(2)
-        
-        with col_conn1:
-            if st.button("🔗 Connect", use_container_width=True, type="primary"):
-                with st.spinner("Connecting..."):
-                    if connect_mqtt():
-                        st.success("Connected!")
-                        time.sleep(1)
-                        st.rerun()
-        
-        with col_conn2:
-            if st.button("🔌 Disconnect", use_container_width=True):
-                if st.session_state.mqtt_client:
-                    st.session_state.mqtt_client.loop_stop()
-                    st.session_state.mqtt_connected = False
-                    add_log("Disconnected from HiveMQ")
-                    st.warning("Disconnected")
-                    st.rerun()
-        
-        st.markdown("---")
-        
-        # Manual input untuk testing
-        st.subheader("🧪 Manual Testing")
-        
-        manual_temp = st.slider("Temperature (°C)", 15.0, 35.0, 
-                               st.session_state.sensor_data['temperature'], 0.1)
-        manual_hum = st.slider("Humidity (%)", 30.0, 90.0,
-                              st.session_state.sensor_data['humidity'], 0.1)
-        
-        if st.button("🔮 Predict with ML", use_container_width=True):
-            # Update sensor data dengan manual input
-            st.session_state.sensor_data.update({
-                "temperature": manual_temp,
-                "humidity": manual_hum,
-                "timestamp": datetime.now().strftime("%H:%M:%S"),
-                "last_update": datetime.now()
-            })
-            add_log(f"Manual input: {manual_temp}°C, {manual_hum}%")
-            st.rerun()
-        
-        st.markdown("---")
-        
-        # Kontrol LED
-        st.subheader("💡 LED Control")
-        
-        col_led1, col_led2 = st.columns(2)
-        with col_led1:
-            if st.button("🔴 RED", use_container_width=True):
-                send_led_command("merah")
-            
-            if st.button("🟢 GREEN", use_container_width=True):
-                send_led_command("hijau")
-        
-        with col_led2:
-            if st.button("🟡 YELLOW", use_container_width=True):
-                send_led_command("kuning")
-            
-            if st.button("⚫ OFF", use_container_width=True):
-                send_led_command("off")
-        
-        st.markdown("---")
-        
-        # Dataset control
-        st.subheader("📊 Dataset")
-        
-        dataset_df = load_dataset()
-        if not dataset_df.empty:
-            st.info(f"📁 {len(dataset_df)} records loaded")
-            
-            # Download button
-            csv_data = dataset_df.to_csv(index=False)
-            st.download_button(
-                label="📥 Download CSV",
-                data=csv_data,
-                file_name=f"iot_dataset_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        else:
-            st.warning("No dataset available")
-        
-        # Refresh button
-        if st.button("🔄 Refresh Dashboard", use_container_width=True, type="secondary"):
-            st.rerun()
-        
-        # Auto-refresh toggle
-        auto_refresh = st.checkbox("🔄 Auto-refresh (5s)", value=False)
-        
-        return auto_refresh
-
-# ==================== MAIN DASHBOARD ====================
-def main():
-    # Header
+    # Header REAL
     st.markdown("""
-    <div class="main-header">
-        <h1>🌡️ IoT SMART DASHBOARD</h1>
-        <h4>Real-time Sensor Monitoring & ML Prediction System</h4>
-        <p>Connected to ESP32 DHT11 via HiveMQ Cloud</p>
+    <div class="real-time-card">
+        <h1 style="margin: 0; font-size: 2.5rem;">🌡️ IOT REAL-TIME DASHBOARD</h1>
+        <p style="font-size: 1.2rem; opacity: 0.9;">Live Monitoring from ESP32 DHT11 via HiveMQ Cloud</p>
+        <div style="margin-top: 15px;">
+            <span class="status-connected">REAL DATA</span>
+            <span style="margin: 0 10px;">•</span>
+            <span>ESP32 DHT11</span>
+            <span style="margin: 0 10px;">•</span>
+            <span>HiveMQ Cloud</span>
+        </div>
     </div>
     """, unsafe_allow_html=True)
     
-    # Sidebar controls
-    auto_refresh = sidebar_controls()
+    # Sidebar - Kontrol REAL
+    with st.sidebar:
+        st.markdown("### 🔗 MQTT CONNECTION")
+        
+        # Status koneksi REAL
+        col_status1, col_status2 = st.columns([1, 2])
+        with col_status1:
+            if st.session_state.iot_system["mqtt_connected"]:
+                st.markdown('<div class="status-connected">🟢 ONLINE</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="status-disconnected">🔴 OFFLINE</div>', unsafe_allow_html=True)
+        
+        with col_status2:
+            uptime = calculate_uptime()
+            st.caption(f"Uptime: {uptime}")
+        
+        # Tombol koneksi REAL
+        if st.button("🔗 CONNECT HIVEMQ", type="primary", use_container_width=True):
+            with st.spinner("Connecting to HiveMQ Cloud..."):
+                if connect_to_hivemq():
+                    st.success("✅ Connected to ESP32!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ Connection failed")
+        
+        if st.button("🔌 DISCONNECT", use_container_width=True):
+            if st.session_state.mqtt_client:
+                st.session_state.mqtt_client.loop_stop()
+                st.session_state.iot_system["mqtt_connected"] = False
+                st.warning("Disconnected from HiveMQ")
+                st.rerun()
+        
+        st.markdown("---")
+        
+        # Kontrol LED REAL
+        st.markdown("### 💡 LED CONTROL")
+        
+        # Mode kontrol
+        mode = st.radio("Control Mode", ["Auto", "Manual"], 
+                       index=1 if st.session_state.iot_system["led_mode"] == "manual" else 0)
+        
+        if mode == "Manual":
+            st.session_state.iot_system["led_mode"] = "manual"
+            
+            col_led1, col_led2 = st.columns(2)
+            with col_led1:
+                if st.button("🔴 RED", use_container_width=True):
+                    send_led_command("merah")
+                
+                if st.button("🟢 GREEN", use_container_width=True):
+                    send_led_command("hijau")
+            
+            with col_led2:
+                if st.button("🟡 YELLOW", use_container_width=True):
+                    send_led_command("kuning")
+                
+                if st.button("⚫ OFF", use_container_width=True):
+                    send_led_command("off")
+        else:
+            st.session_state.iot_system["led_mode"] = "auto"
+            st.info("LED control: AUTO (based on temperature)")
+        
+        st.markdown("---")
+        
+        # System Info REAL
+        st.markdown("### 📊 SYSTEM INFO")
+        
+        info_items = [
+            ("Data Points", st.session_state.iot_system["data_points"]),
+            ("Current LED", st.session_state.iot_system["led_status"].upper()),
+            ("Control Mode", st.session_state.iot_system["led_mode"].upper()),
+            ("Last Update", st.session_state.iot_system["timestamp"] or "N/A")
+        ]
+        
+        for label, value in info_items:
+            st.write(f"**{label}:** {value}")
+        
+        st.markdown("---")
+        
+        # Refresh control
+        auto_refresh = st.checkbox("🔄 Auto-refresh (3s)", value=True)
+        
+        if st.button("🔄 MANUAL REFRESH", use_container_width=True):
+            st.rerun()
     
-    # Load models dan data
-    models, scaler = load_ml_models()
-    dataset_df = load_dataset()
+    # ============ MAIN DASHBOARD - DATA REAL ============
     
-    # ============ ROW 1: REAL-TIME SENSOR DATA ============
-    st.subheader("📡 LIVE SENSOR DATA")
-    
+    # Row 1: Sensor Data REAL
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        temp = st.session_state.sensor_data['temperature']
+        temp = st.session_state.iot_system["temperature"]
+        temp_color = "#EF4444"  # Red for temperature
+        
         st.markdown(f"""
-        <div class="metric-card" style="border-left-color: #EF4444;">
-            <h3 style="color: #EF4444; margin-top: 0;">🌡️ TEMPERATURE</h3>
-            <h1 style="color: #EF4444; font-size: 2.8rem;">{temp:.1f} °C</h1>
-            <p>Real-time from DHT11</p>
+        <div class="sensor-card" style="border-left-color: {temp_color};">
+            <div style="font-size: 1.2rem; color: #6B7280; margin-bottom: 10px;">
+                🌡️ REAL TEMPERATURE
+            </div>
+            <div class="sensor-value data-point" style="color: {temp_color};">
+                {temp:.1f} °C
+            </div>
+            <div style="color: #6B7280; font-size: 0.9rem;">
+                From ESP32 DHT11
+            </div>
         </div>
         """, unsafe_allow_html=True)
     
     with col2:
-        hum = st.session_state.sensor_data['humidity']
+        hum = st.session_state.iot_system["humidity"]
+        hum_color = "#3B82F6"  # Blue for humidity
+        
         st.markdown(f"""
-        <div class="metric-card" style="border-left-color: #3B82F6;">
-            <h3 style="color: #3B82F6; margin-top: 0;">💧 HUMIDITY</h3>
-            <h1 style="color: #3B82F6; font-size: 2.8rem;">{hum:.1f} %</h1>
-            <p>Real-time from DHT11</p>
+        <div class="sensor-card" style="border-left-color: {hum_color};">
+            <div style="font-size: 1.2rem; color: #6B7280; margin-bottom: 10px;">
+                💧 REAL HUMIDITY
+            </div>
+            <div class="sensor-value data-point" style="color: {hum_color};">
+                {hum:.1f} %
+            </div>
+            <div style="color: #6B7280; font-size: 0.9rem;">
+                From ESP32 DHT11
+            </div>
         </div>
         """, unsafe_allow_html=True)
     
     with col3:
-        label = st.session_state.sensor_data['label']
-        label_class = f"label-{label.lower()}"
+        label = st.session_state.iot_system["label"]
+        label_class = label.split()[0].lower()
         
-        # Tentukan warna berdasarkan label
-        if label == "DINGIN":
-            color = "#3B82F6"
+        if "DINGIN" in label:
+            label_color = "#3B82F6"
             icon = "🥶"
-        elif label == "PANAS":
-            color = "#EF4444"
+        elif "PANAS" in label:
+            label_color = "#EF4444"
             icon = "🔥"
         else:
-            color = "#10B981"
+            label_color = "#10B981"
             icon = "✅"
         
         st.markdown(f"""
-        <div class="metric-card" style="border-left-color: {color};">
-            <h3 style="color: {color}; margin-top: 0;">🏷️ STATUS</h3>
-            <h1 style="color: {color}; font-size: 2.8rem;">{icon} {label}</h1>
-            <p>Based on temperature threshold</p>
+        <div class="sensor-card" style="border-left-color: {label_color};">
+            <div style="font-size: 1.2rem; color: #6B7280; margin-bottom: 10px;">
+                🏷️ ROOM STATUS
+            </div>
+            <div class="sensor-value" style="color: {label_color};">
+                {icon} {label}
+            </div>
+            <div style="color: #6B7280; font-size: 0.9rem;">
+                Based on temperature
+            </div>
         </div>
         """, unsafe_allow_html=True)
     
     with col4:
-        last_update = st.session_state.sensor_data['last_update']
-        time_diff = datetime.now() - last_update
-        seconds = time_diff.total_seconds()
-        
-        if seconds < 5:
-            status_color = "#10B981"
-            status_text = "LIVE"
-        elif seconds < 30:
-            status_color = "#F59E0B"
-            status_text = f"{int(seconds)}s ago"
+        # Data freshness indicator
+        if st.session_state.iot_system["last_update"]:
+            time_diff = datetime.now() - st.session_state.iot_system["last_update"]
+            seconds = time_diff.total_seconds()
+            
+            if seconds < 5:
+                status_color = "#10B981"
+                status_text = "LIVE"
+                status_icon = "🟢"
+            elif seconds < 30:
+                status_color = "#F59E0B"
+                status_text = f"{int(seconds)}s"
+                status_icon = "🟡"
+            else:
+                status_color = "#EF4444"
+                status_text = f"{int(seconds)}s"
+                status_icon = "🔴"
         else:
-            status_color = "#EF4444"
-            status_text = f"{int(seconds)}s ago"
+            status_color = "#6B7280"
+            status_text = "WAITING"
+            status_icon = "⚪"
         
         st.markdown(f"""
-        <div class="metric-card" style="border-left-color: {status_color};">
-            <h3 style="color: {status_color}; margin-top: 0;">🕐 LAST UPDATE</h3>
-            <h1 style="color: {status_color}; font-size: 2.8rem;">{status_text}</h1>
-            <p>{st.session_state.sensor_data['timestamp']}</p>
+        <div class="sensor-card" style="border-left-color: {status_color};">
+            <div style="font-size: 1.2rem; color: #6B7280; margin-bottom: 10px;">
+                🕐 DATA STATUS
+            </div>
+            <div class="sensor-value" style="color: {status_color};">
+                {status_icon} {status_text}
+            </div>
+            <div style="color: #6B7280; font-size: 0.9rem;">
+                Last: {st.session_state.iot_system['timestamp'] or 'No data'}
+            </div>
         </div>
         """, unsafe_allow_html=True)
     
     st.markdown("---")
     
-    # ============ ROW 2: ML PREDICTIONS ============
-    st.subheader("🤖 MACHINE LEARNING PREDICTIONS")
-    
-    if models and scaler:
-        # Get predictions
-        predictions = predict_with_models(
-            models, scaler,
-            st.session_state.sensor_data['temperature'],
-            st.session_state.sensor_data['humidity'],
-            datetime.now().hour,
-            datetime.now().minute
-        )
+    # Row 2: Real-time Charts (HANYA jika ada data REAL)
+    if len(st.session_state.data_history["timestamps"]) > 1:
+        st.markdown("### 📈 REAL-TIME SENSOR CHARTS")
         
-        if predictions:
-            # Display predictions in columns
-            n_models = len(predictions)
-            pred_cols = st.columns(n_models)
+        # Prepare data untuk plotting
+        history_df = pd.DataFrame({
+            'Time': [t.strftime("%H:%M:%S") for t in st.session_state.data_history["timestamps"]],
+            'Temperature': st.session_state.data_history["temperatures"],
+            'Humidity': st.session_state.data_history["humidities"],
+            'Label': st.session_state.data_history["labels"]
+        })
+        
+        # Buat tabs untuk berbagai chart
+        tab1, tab2, tab3 = st.tabs(["Temperature Trend", "Humidity Trend", "Live Scatter"])
+        
+        with tab1:
+            fig_temp = go.Figure()
             
-            for idx, (model_name, pred) in enumerate(predictions.items()):
-                with pred_cols[idx]:
-                    # Tentukan warna berdasarkan label
-                    label_color = {
-                        'DINGIN': '#3B82F6',
-                        'NORMAL': '#10B981',
-                        'PANAS': '#EF4444',
-                        'ERROR': '#6B7280'
-                    }.get(pred['label'], '#6B7280')
-                    
-                    st.markdown(f"""
-                    <div class="prediction-card" style="border-color: {label_color};">
-                        <h3 style="color: {label_color};">{model_name}</h3>
-                        <h1 style="color: {label_color}; font-size: 2.5rem; margin: 1rem 0;">
-                            {pred['label']}
-                        </h1>
-                        <p style="font-size: 1.2rem;">
-                            Confidence: <strong>{pred.get('confidence', 0):.1%}</strong>
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
+            fig_temp.add_trace(go.Scatter(
+                x=history_df['Time'],
+                y=history_df['Temperature'],
+                mode='lines+markers',
+                name='Temperature',
+                line=dict(color='#EF4444', width=3),
+                marker=dict(size=8, color='#EF4444'),
+                hovertemplate='<b>%{x}</b><br>Temperature: %{y:.1f}°C<extra></extra>'
+            ))
             
-            # Model agreement
-            st.subheader("📊 Model Agreement Analysis")
+            # Add threshold lines
+            fig_temp.add_hline(y=22, line_dash="dash", line_color="#3B82F6", 
+                             annotation_text="DINGIN (<22°C)")
+            fig_temp.add_hline(y=25, line_dash="dash", line_color="#EF4444",
+                             annotation_text="PANAS (>25°C)")
             
-            labels = [pred['label'] for pred in predictions.values() if pred['label'] != 'ERROR']
-            if labels:
-                unique_labels = set(labels)
-                
-                if len(unique_labels) == 1:
-                    st.success(f"✅ All models agree: **{list(unique_labels)[0]}**")
-                    st.balloons()
-                else:
-                    st.warning(f"⚠️ Models disagree: {', '.join(unique_labels)}")
-                    
-                    # Show detailed probabilities
-                    with st.expander("View Detailed Probabilities"):
-                        prob_data = []
-                        for model_name, pred in predictions.items():
-                            if 'probabilities' in pred:
-                                row = {'Model': model_name}
-                                row.update(pred['probabilities'])
-                                prob_data.append(row)
-                        
-                        if prob_data:
-                            prob_df = pd.DataFrame(prob_data)
-                            st.dataframe(prob_df, use_container_width=True)
+            fig_temp.update_layout(
+                title="Temperature Trend - REAL DATA",
+                xaxis_title="Time",
+                yaxis_title="Temperature (°C)",
+                height=400,
+                hovermode="x unified",
+                showlegend=True
+            )
             
-            # Prediction comparison chart
-            if any('probabilities' in pred for pred in predictions.values()):
-                st.subheader("📈 Prediction Probability Comparison")
-                
-                # Prepare data for chart
-                chart_data = []
-                for model_name, pred in predictions.items():
-                    if 'probabilities' in pred:
-                        for label, prob in pred['probabilities'].items():
-                            chart_data.append({
-                                'Model': model_name,
-                                'Label': label,
-                                'Probability': prob
-                            })
-                
-                if chart_data:
-                    chart_df = pd.DataFrame(chart_data)
-                    
-                    fig = px.bar(
-                        chart_df,
-                        x='Model',
-                        y='Probability',
-                        color='Label',
-                        barmode='group',
-                        color_discrete_map={
-                            'DINGIN': '#3B82F6',
-                            'NORMAL': '#10B981',
-                            'PANAS': '#EF4444'
-                        },
-                        title="Model Prediction Probabilities"
-                    )
-                    
-                    fig.update_layout(
-                        height=400,
-                        showlegend=True,
-                        yaxis_range=[0, 1]
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No predictions available. Check if models are loaded correctly.")
+            st.plotly_chart(fig_temp, use_container_width=True)
+        
+        with tab2:
+            fig_hum = go.Figure()
+            
+            fig_hum.add_trace(go.Scatter(
+                x=history_df['Time'],
+                y=history_df['Humidity'],
+                mode='lines+markers',
+                name='Humidity',
+                line=dict(color='#3B82F6', width=3),
+                marker=dict(size=8, color='#3B82F6'),
+                hovertemplate='<b>%{x}</b><br>Humidity: %{y:.1f}%<extra></extra>'
+            ))
+            
+            fig_hum.update_layout(
+                title="Humidity Trend - REAL DATA",
+                xaxis_title="Time",
+                yaxis_title="Humidity (%)",
+                height=400,
+                hovermode="x unified",
+                showlegend=True
+            )
+            
+            st.plotly_chart(fig_hum, use_container_width=True)
+        
+        with tab3:
+            fig_scatter = px.scatter(
+                history_df,
+                x='Temperature',
+                y='Humidity',
+                color='Label',
+                color_discrete_map={
+                    'DINGIN 🥶': '#3B82F6',
+                    'NORMAL ✅': '#10B981',
+                    'PANAS 🔥': '#EF4444'
+                },
+                title="Temperature vs Humidity - REAL DATA",
+                hover_data=['Time']
+            )
+            
+            fig_scatter.update_traces(marker=dict(size=12))
+            fig_scatter.update_layout(height=400)
+            
+            st.plotly_chart(fig_scatter, use_container_width=True)
     else:
-        st.warning("ML models not loaded. Run training first or check model files.")
+        st.info("⏳ Waiting for real-time data from ESP32... Connect to HiveMQ to see live charts.")
     
     st.markdown("---")
     
-    # ============ ROW 3: DATA VISUALIZATION ============
-    st.subheader("📊 DATA VISUALIZATION & HISTORY")
+    # Row 3: Data Table & System Logs
+    col_data, col_logs = st.columns([2, 1])
     
-    # Tabs untuk berbagai visualisasi
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Real-time Trends", "🎯 Temperature Analysis", "📋 Historical Data", "📝 System Logs"])
-    
-    with tab1:
-        # Real-time trends dari history
-        if len(st.session_state.data_history) > 1:
-            history_df = pd.DataFrame(st.session_state.data_history)
+    with col_data:
+        st.markdown("### 📋 RECENT DATA HISTORY")
+        
+        if len(st.session_state.data_history["timestamps"]) > 0:
+            # Create dataframe dari history data
+            recent_data = pd.DataFrame({
+                'Timestamp': [t.strftime("%H:%M:%S") for t in st.session_state.data_history["timestamps"][-10:]],
+                'Temperature (°C)': st.session_state.data_history["temperatures"][-10:],
+                'Humidity (%)': st.session_state.data_history["humidities"][-10:],
+                'Status': st.session_state.data_history["labels"][-10:]
+            })
             
-            fig = make_subplots(
-                rows=2, cols=1,
-                subplot_titles=('Temperature Trend', 'Humidity Trend'),
-                vertical_spacing=0.1
-            )
+            # Style the dataframe
+            def color_status(val):
+                if 'DINGIN' in val:
+                    color = '#3B82F6'
+                elif 'PANAS' in val:
+                    color = '#EF4444'
+                else:
+                    color = '#10B981'
+                return f'color: {color}; font-weight: bold'
             
-            # Temperature plot
-            fig.add_trace(
-                go.Scatter(
-                    x=history_df['timestamp'],
-                    y=history_df['temperature'],
-                    mode='lines+markers',
-                    name='Temperature',
-                    line=dict(color='#EF4444', width=2),
-                    marker=dict(size=6)
-                ),
-                row=1, col=1
-            )
-            
-            # Add threshold lines
-            fig.add_hline(y=25, line_dash="dash", line_color="#3B82F6", 
-                         annotation_text="Cold (<25°C)", row=1, col=1)
-            fig.add_hline(y=28, line_dash="dash", line_color="#EF4444",
-                         annotation_text="Hot (>28°C)", row=1, col=1)
-            
-            # Humidity plot
-            fig.add_trace(
-                go.Scatter(
-                    x=history_df['timestamp'],
-                    y=history_df['humidity'],
-                    mode='lines+markers',
-                    name='Humidity',
-                    line=dict(color='#3B82F6', width=2),
-                    marker=dict(size=6)
-                ),
-                row=2, col=1
-            )
-            
-            fig.update_layout(
-                height=500,
-                showlegend=True,
-                hovermode="x unified"
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("Collecting real-time data... Connect to HiveMQ to see live trends.")
-    
-    with tab2:
-        # Temperature analysis
-        if not dataset_df.empty:
-            col_analysis1, col_analysis2 = st.columns(2)
-            
-            with col_analysis1:
-                # Temperature distribution
-                fig1 = px.histogram(
-                    dataset_df,
-                    x='temperature',
-                    nbins=20,
-                    title='Temperature Distribution',
-                    color_discrete_sequence=['#EF4444']
-                )
-                fig1.update_layout(height=300)
-                st.plotly_chart(fig1, use_container_width=True)
-            
-            with col_analysis2:
-                # Temperature vs Humidity scatter
-                fig2 = px.scatter(
-                    dataset_df,
-                    x='temperature',
-                    y='humidity',
-                    color='label',
-                    title='Temperature vs Humidity',
-                    color_discrete_map={
-                        'DINGIN': '#3B82F6',
-                        'NORMAL': '#10B981',
-                        'PANAS': '#EF4444'
-                    },
-                    hover_data=['timestamp']
-                )
-                fig2.update_layout(height=300)
-                st.plotly_chart(fig2, use_container_width=True)
-            
-            # Label distribution pie chart
-            if 'label' in dataset_df.columns:
-                label_counts = dataset_df['label'].value_counts()
-                fig3 = px.pie(
-                    values=label_counts.values,
-                    names=label_counts.index,
-                    title='Label Distribution in Dataset',
-                    color=label_counts.index,
-                    color_discrete_map={
-                        'DINGIN': '#3B82F6',
-                        'NORMAL': '#10B981',
-                        'PANAS': '#EF4444'
-                    }
-                )
-                fig3.update_layout(height=400)
-                st.plotly_chart(fig3, use_container_width=True)
-        else:
-            st.info("No historical data available. Collect data first.")
-    
-    with tab3:
-        # Historical data table
-        if not dataset_df.empty:
-            st.subheader("📋 Dataset Preview")
-            
-            # Filter controls
-            col_filter1, col_filter2 = st.columns(2)
-            with col_filter1:
-                date_filter = st.selectbox("Filter by date", 
-                                         ['All dates'] + sorted(dataset_df['date'].unique().astype(str).tolist()))
-            
-            with col_filter2:
-                label_filter = st.selectbox("Filter by label", 
-                                          ['All labels'] + sorted(dataset_df['label'].unique().tolist()))
-            
-            # Apply filters
-            filtered_df = dataset_df.copy()
-            if date_filter != 'All dates':
-                filtered_df = filtered_df[filtered_df['date'].astype(str) == date_filter]
-            if label_filter != 'All labels':
-                filtered_df = filtered_df[filtered_df['label'] == label_filter]
-            
-            # Show statistics
-            st.write(f"**Showing {len(filtered_df)} of {len(dataset_df)} records**")
+            styled_df = recent_data.style.applymap(color_status, subset=['Status'])
             
             # Display table
-            display_cols = ['timestamp', 'temperature', 'humidity', 'label']
-            if all(col in filtered_df.columns for col in display_cols):
-                st.dataframe(
-                    filtered_df[display_cols].sort_values('timestamp', ascending=False).head(50),
-                    use_container_width=True,
-                    height=400
-                )
-            else:
-                st.dataframe(filtered_df.head(50), use_container_width=True, height=400)
+            st.dataframe(styled_df, use_container_width=True, height=350)
             
-            # Download filtered data
-            csv_filtered = filtered_df.to_csv(index=False)
+            # Download button untuk data REAL
+            csv_data = recent_data.to_csv(index=False)
             st.download_button(
-                label="📥 Download Filtered Data",
-                data=csv_filtered,
-                file_name=f"filtered_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv"
+                label="📥 Download Recent Data",
+                data=csv_data,
+                file_name=f"iot_data_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+                use_container_width=True
             )
         else:
-            st.info("No historical data available.")
+            st.info("No data received yet")
     
-    with tab4:
-        # System logs
-        st.subheader("📝 System Logs")
+    with col_logs:
+        st.markdown("### 📝 SYSTEM LOGS")
         
         # Log container
         st.markdown('<div class="log-container">', unsafe_allow_html=True)
         
         # Display logs (newest first)
-        logs = st.session_state.system_logs[::-1]
-        for log in logs[:30]:  # Show last 30 logs
-            # Color code log messages
+        for log in st.session_state.iot_system["system_logs"][:15]:
+            # Color code berdasarkan tipe log
             if "✅" in log or "Connected" in log:
                 st.markdown(f'<span style="color: #10B981;">{log}</span>', unsafe_allow_html=True)
-            elif "❌" in log or "Error" in log or "failed" in log.lower():
+            elif "❌" in log or "Error" in log or "failed" in log:
                 st.markdown(f'<span style="color: #EF4444;">{log}</span>', unsafe_allow_html=True)
-            elif "⚠️" in log or "Warning" in log or "Disconnected" in log:
+            elif "⚠️" in log or "Warning" in log:
+                st.markdown(f'<span style="color: #F59E0B;">{log}</span>', unsafe_allow_html=True)
+            elif "📡" in log:
+                st.markdown(f'<span style="color: #8B5CF6;">{log}</span>', unsafe_allow_html=True)
+            elif "🌡️" in log:
+                st.markdown(f'<span style="color: #EF4444;">{log}</span>', unsafe_allow_html=True)
+            elif "💡" in log:
                 st.markdown(f'<span style="color: #F59E0B;">{log}</span>', unsafe_allow_html=True)
             else:
                 st.markdown(f'<span style="color: #E5E7EB;">{log}</span>', unsafe_allow_html=True)
@@ -882,72 +792,78 @@ def main():
         st.markdown('</div>', unsafe_allow_html=True)
         
         # Clear logs button
-        if st.button("🗑️ Clear Logs"):
-            st.session_state.system_logs = []
+        if st.button("🗑️ Clear Logs", use_container_width=True):
+            st.session_state.iot_system["system_logs"] = []
             st.rerun()
     
     st.markdown("---")
     
-    # ============ ROW 4: SYSTEM STATUS ============
-    st.subheader("⚙️ SYSTEM STATUS")
+    # Row 4: System Statistics
+    st.markdown("### 📊 SYSTEM STATISTICS")
     
-    col_status1, col_status2, col_status3 = st.columns(3)
+    col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
     
-    with col_status1:
-        st.markdown("""
-        <div class="data-table">
-            <h4>🔗 Connection Status</h4>
-            <p><strong>MQTT:</strong> {'✅ Connected' if st.session_state.mqtt_connected else '❌ Disconnected'}</p>
-            <p><strong>Broker:</strong> HiveMQ Cloud</p>
-            <p><strong>Topic:</strong> {DHT_TOPIC}</p>
-        </div>
-        """.format(DHT_TOPIC=DHT_TOPIC), unsafe_allow_html=True)
+    with col_stat1:
+        data_rate = st.session_state.iot_system["data_points"] / max(1, (datetime.now() - st.session_state.iot_system["uptime"]).seconds)
+        st.metric("📈 Data Rate", f"{data_rate:.2f}/s", "Samples per second")
     
-    with col_status2:
-        st.markdown(f"""
-        <div class="data-table">
-            <h4>📊 Data Status</h4>
-            <p><strong>Live Data:</strong> {'✅ Receiving' if len(st.session_state.data_history) > 0 else '⏳ Waiting'}</p>
-            <p><strong>History Size:</strong> {len(st.session_state.data_history)} records</p>
-            <p><strong>Dataset Size:</strong> {len(dataset_df)} records</p>
-            <p><strong>Last Data:</strong> {st.session_state.sensor_data['timestamp']}</p>
-        </div>
-        """, unsafe_allow_html=True)
+    with col_stat2:
+        if len(st.session_state.data_history["temperatures"]) > 0:
+            avg_temp = np.mean(st.session_state.data_history["temperatures"])
+            st.metric("🌡️ Avg Temp", f"{avg_temp:.1f}°C", "Historical average")
+        else:
+            st.metric("🌡️ Avg Temp", "0.0°C", "No data")
     
-    with col_status3:
-        ml_status = "✅ Loaded" if models and len(models) > 0 else "⚠️ Not Loaded"
-        model_count = len(models) if models else 0
-        
-        st.markdown(f"""
-        <div class="data-table">
-            <h4>🤖 ML System Status</h4>
-            <p><strong>ML Models:</strong> {ml_status}</p>
-            <p><strong>Models Loaded:</strong> {model_count}</p>
-            <p><strong>Scaler:</strong> {'✅ Loaded' if scaler else '⚠️ Not Loaded'}</p>
-            <p><strong>Predictions:</strong> Active</p>
-        </div>
-        """, unsafe_allow_html=True)
+    with col_stat3:
+        if len(st.session_state.data_history["humidities"]) > 0:
+            avg_hum = np.mean(st.session_state.data_history["humidities"])
+            st.metric("💧 Avg Hum", f"{avg_hum:.1f}%", "Historical average")
+        else:
+            st.metric("💧 Avg Hum", "0.0%", "No data")
+    
+    with col_stat4:
+        if len(st.session_state.data_history["labels"]) > 0:
+            # Hitung distribusi label
+            labels = st.session_state.data_history["labels"]
+            dingin_count = sum(1 for l in labels if 'DINGIN' in l)
+            normal_count = sum(1 for l in labels if 'NORMAL' in l)
+            panas_count = sum(1 for l in labels if 'PANAS' in l)
+            
+            total = len(labels)
+            if total > 0:
+                dominant = max([('DINGIN', dingin_count), ('NORMAL', normal_count), ('PANAS', panas_count)], 
+                             key=lambda x: x[1])
+                st.metric("🏷️ Dominant", dominant[0], f"{dominant[1]}/{total}")
+            else:
+                st.metric("🏷️ Dominant", "N/A", "No data")
+        else:
+            st.metric("🏷️ Dominant", "N/A", "No data")
     
     # Footer
     st.markdown("---")
     st.markdown("""
-    <div style="text-align: center; color: #6B7280; padding: 1rem;">
-        <p><strong>🌐 IoT Smart Dashboard v2.0</strong> | Real-time DHT11 Monitoring & ML Prediction</p>
-        <p>Connected to ESP32 via HiveMQ Cloud | Powered by Streamlit & Scikit-learn</p>
-        <p>© 2024 IoT Smart Monitoring System</p>
+    <div style="text-align: center; color: #6B7280; padding: 20px;">
+        <p style="font-size: 1.1rem;"><strong>🌐 IOT REAL-TIME MONITORING SYSTEM v2.0</strong></p>
+        <p>Connected to <strong>ESP32 DHT11</strong> via <strong>HiveMQ Cloud</strong> | Data updates every 2 seconds</p>
+        <p>Broker: <code>f44c5a09b28447449642c2c62b63bba7.s1.eu.hivemq.cloud</code> | Topic: <code>sic/dibimbing/kelompok-SENSOR/FARIZ/pub/dht</code></p>
+        <p style="margin-top: 15px; font-size: 0.9rem;">© 2024 IoT Smart Monitoring | 100% Real Data from Physical Sensors</p>
     </div>
     """, unsafe_allow_html=True)
     
     # Auto-refresh jika diaktifkan
     if auto_refresh:
-        time.sleep(5)
+        time.sleep(3)
         st.rerun()
 
-# ==================== RUN DASHBOARD ====================
+# ==================== RUN REAL DASHBOARD ====================
 if __name__ == "__main__":
+    # Initial connection attempt
+    if not st.session_state.iot_system["mqtt_connected"]:
+        # Try to connect in background
+        threading.Thread(target=connect_to_hivemq, daemon=True).start()
+    
     try:
         main()
     except Exception as e:
         st.error(f"⚠️ Dashboard Error: {str(e)}")
-        st.info("Please refresh the page or check your connection.")
-
+        st.info("Please refresh the page or check your internet connection.")
