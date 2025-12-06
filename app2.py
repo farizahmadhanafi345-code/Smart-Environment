@@ -20,8 +20,8 @@ warnings.filterwarnings('ignore')
 MQTT_CONFIG = {
     "broker": "f44c5a09b28447449642c2c62b63bba7.s1.eu.hivemq.cloud",
     "port": 8883,
-    "username": "hivemq.webclient.1764923408610",
-    "password": "9y&f74G1*pWSD.tQdXa@",
+    "username": "fariz_device_main",
+    "password": "F4riz#Device2025!",
     "use_ssl": True,
     "keepalive": 20
 }
@@ -889,3 +889,4 @@ if __name__ == "__main__":
     except Exception as e:
         st.error(f"⚠️ Dashboard Error: {str(e)}")
         st.info("Please check your internet connection and ESP32 status.")
+
