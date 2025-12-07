@@ -209,6 +209,99 @@ def load_and_prepare_data():
     
     return X_train_scaled, X_test_scaled, y_train, y_test, scaler, df, X_test
 
+# ==================== CHECK IF MODELS EXIST ====================
+def check_if_models_exist():
+    """Check if models are already trained and saved"""
+    model_files = [
+        'decision_tree.pkl',
+        'k-nearest_neighbors.pkl', 
+        'logistic_regression.pkl',
+        'scaler.pkl',
+        'metadata.json'
+    ]
+    
+    existing = []
+    missing = []
+    
+    for filename in model_files:
+        path = os.path.join(MODELS_DIR, filename)
+        if os.path.exists(path):
+            existing.append(filename)
+        else:
+            missing.append(filename)
+    
+    return existing, missing
+
+# ==================== LOAD ALL MODELS ====================
+def load_all_models():
+    """Load all previously saved models"""
+    print("\n📂 LOADING PREVIOUSLY TRAINED MODELS...")
+    
+    models = {}
+    scaler = None
+    
+    # Load scaler
+    scaler_path = os.path.join(MODELS_DIR, 'scaler.pkl')
+    if os.path.exists(scaler_path):
+        try:
+            with open(scaler_path, 'rb') as f:
+                scaler = pickle.load(f)
+            print("✅ Loaded: scaler.pkl")
+        except:
+            print("❌ Failed to load scaler")
+            scaler = None
+    else:
+        print("⚠️  Scaler not found")
+    
+    # Load all individual models
+    model_files = {
+        'Decision Tree': 'decision_tree.pkl',
+        'K-Nearest Neighbors': 'k-nearest_neighbors.pkl',
+        'Logistic Regression': 'logistic_regression.pkl'
+    }
+    
+    for model_name, filename in model_files.items():
+        model_path = os.path.join(MODELS_DIR, filename)
+        if os.path.exists(model_path):
+            try:
+                with open(model_path, 'rb') as f:
+                    model = pickle.load(f)
+                
+                # Create dummy results structure for prediction
+                models[model_name] = {
+                    'model': model,
+                    'accuracy': 0.0,  # Will be updated if metadata exists
+                    'precision': 0.0,
+                    'recall': 0.0,
+                    'f1_score': 0.0
+                }
+                print(f"✅ Loaded: {filename}")
+            except Exception as e:
+                print(f"❌ Failed to load {filename}: {e}")
+        else:
+            print(f"⚠️  {filename} not found")
+    
+    # Load metadata
+    metadata_path = os.path.join(MODELS_DIR, 'metadata.json')
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            print("✅ Loaded: metadata.json")
+            
+            # Update model performance metrics from metadata
+            for model_name in models.keys():
+                if model_name in metadata.get('performance', {}):
+                    perf = metadata['performance'][model_name]
+                    models[model_name]['accuracy'] = perf.get('accuracy', 0.0)
+                    models[model_name]['precision'] = perf.get('precision', 0.0)
+                    models[model_name]['recall'] = perf.get('recall', 0.0)
+                    models[model_name]['f1_score'] = perf.get('f1_score', 0.0)
+        except:
+            print("❌ Failed to load metadata")
+    
+    return models, scaler if scaler else None
+
 # ==================== TRAIN ALL MODELS ====================
 def train_all_models(X_train, X_test, y_train, y_test):
     print("\n" + "="*60)
@@ -421,6 +514,17 @@ def create_all_visualizations(results, X_test_df, y_test, label_names):
         
         for idx, (name, result) in enumerate(results.items()):
             ax = axes[idx]
+            
+            # Check if y_pred exists
+            if 'y_pred' not in result:
+                # Try to generate predictions if model exists
+                if 'model' in result:
+                    y_pred = result['model'].predict(X_test_df)
+                    result['y_pred'] = y_pred
+                else:
+                    print(f"⚠️  No predictions for {name}, skipping confusion matrix")
+                    continue
+            
             cm = confusion_matrix(y_test, result['y_pred'])
             
             # Get unique labels that exist in data
@@ -445,9 +549,11 @@ def create_all_visualizations(results, X_test_df, y_test, label_names):
             disp.plot(cmap='Blues', ax=ax, values_format='d')
             ax.set_title(f'{name}', fontweight='bold', fontsize=12)
             
-            accuracy = result['accuracy']
-            ax.text(0.95, -0.15, f'Accuracy: {accuracy:.3f}', 
-                    transform=ax.transAxes, ha='right', fontsize=10)
+            # Add accuracy if available
+            if 'accuracy' in result:
+                accuracy = result['accuracy']
+                ax.text(0.95, -0.15, f'Accuracy: {accuracy:.3f}', 
+                        transform=ax.transAxes, ha='right', fontsize=10)
         
         plt.tight_layout()
         plt.savefig(os.path.join(REPORTS_DIR, 'all_confusion_matrices.png'), 
@@ -467,19 +573,27 @@ def create_all_visualizations(results, X_test_df, y_test, label_names):
         for idx, (metric, title) in enumerate(zip(metrics_list, metric_names)):
             ax = axes[idx//2, idx%2]
             model_names = list(results.keys())
-            scores = [results[model][metric] for model in model_names]
+            scores = []
             
-            bars = ax.bar(model_names, scores, color=colors[:len(model_names)], alpha=0.8)
-            ax.set_title(title, fontweight='bold', fontsize=12)
-            ax.set_ylabel('Score', fontsize=10)
-            ax.set_ylim(0, 1.1)
-            ax.grid(True, alpha=0.3, axis='y')
+            # Collect scores for each model
+            for model_name in model_names:
+                if metric in results[model_name]:
+                    scores.append(results[model_name][metric])
+                else:
+                    scores.append(0.0)  # Default if metric not available
             
-            # Add value labels
-            for bar in bars:
-                height = bar.get_height()
-                ax.text(bar.get_x() + bar.get_width()/2., height + 0.02,
-                       f'{height:.3f}', ha='center', va='bottom', fontsize=9)
+            if len(scores) > 0:
+                bars = ax.bar(model_names, scores, color=colors[:len(model_names)], alpha=0.8)
+                ax.set_title(title, fontweight='bold', fontsize=12)
+                ax.set_ylabel('Score', fontsize=10)
+                ax.set_ylim(0, 1.1)
+                ax.grid(True, alpha=0.3, axis='y')
+                
+                # Add value labels
+                for bar in bars:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width()/2., height + 0.02,
+                           f'{height:.3f}', ha='center', va='bottom', fontsize=9)
         
         plt.tight_layout()
         plt.savefig(os.path.join(REPORTS_DIR, 'model_comparison.png'), 
@@ -487,33 +601,34 @@ def create_all_visualizations(results, X_test_df, y_test, label_names):
         print("✅ Saved: model_comparison.png")
     
     # 3. FEATURE IMPORTANCE (Decision Tree)
-    if 'Decision Tree' in results:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
+    if 'Decision Tree' in results and 'model' in results['Decision Tree']:
         dt_model = results['Decision Tree']['model']
-        feature_names = ['Temperature', 'Humidity', 'Hour', 'Minute']
-        importances = dt_model.feature_importances_
-        
-        # Sort by importance
-        indices = np.argsort(importances)[::-1]
-        
-        bars = ax.barh(np.array(feature_names)[indices], 
-                      importances[indices], 
-                      color='#FF6B6B', alpha=0.8)
-        
-        ax.set_title('DECISION TREE - FEATURE IMPORTANCE', fontweight='bold', fontsize=14)
-        ax.set_xlabel('Importance Score', fontsize=12)
-        
-        # Add value labels
-        for bar in bars:
-            width = bar.get_width()
-            ax.text(width + 0.01, bar.get_y() + bar.get_height()/2,
-                   f'{width:.3f}', va='center', fontsize=11)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(REPORTS_DIR, 'feature_importance.png'), 
-                    dpi=300, bbox_inches='tight')
-        print("✅ Saved: feature_importance.png")
+        if hasattr(dt_model, 'feature_importances_'):
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            feature_names = ['Temperature', 'Humidity', 'Hour', 'Minute']
+            importances = dt_model.feature_importances_
+            
+            # Sort by importance
+            indices = np.argsort(importances)[::-1]
+            
+            bars = ax.barh(np.array(feature_names)[indices], 
+                          importances[indices], 
+                          color='#FF6B6B', alpha=0.8)
+            
+            ax.set_title('DECISION TREE - FEATURE IMPORTANCE', fontweight='bold', fontsize=14)
+            ax.set_xlabel('Importance Score', fontsize=12)
+            
+            # Add value labels
+            for bar in bars:
+                width = bar.get_width()
+                ax.text(width + 0.01, bar.get_y() + bar.get_height()/2,
+                       f'{width:.3f}', va='center', fontsize=11)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(REPORTS_DIR, 'feature_importance.png'), 
+                        dpi=300, bbox_inches='tight')
+            print("✅ Saved: feature_importance.png")
     
     # 4. RECALL PER CLASS COMPARISON
     if len(results) > 0:
@@ -525,9 +640,15 @@ def create_all_visualizations(results, X_test_df, y_test, label_names):
             # Check if this class exists in any model's predictions
             class_exists = False
             for result in results.values():
-                if len(result['recall_per_class']) > i:
-                    class_exists = True
-                    break
+                if 'recall_per_class' in result and len(result['recall_per_class']) > i:
+                    if result['recall_per_class'][i] > 0:
+                        class_exists = True
+                        break
+                elif 'y_pred' in result:
+                    # Check if class appears in predictions
+                    if i in np.unique(result['y_pred']):
+                        class_exists = True
+                        break
             if class_exists:
                 actual_labels.append(label_names[i])
             else:
@@ -538,11 +659,15 @@ def create_all_visualizations(results, X_test_df, y_test, label_names):
             width = 0.8 / len(results) if len(results) > 0 else 0.25
             
             for i, (model_name, result) in enumerate(results.items()):
-                # Make sure we have enough values
-                recalls = result['recall_per_class']
-                if len(recalls) < len(actual_labels):
-                    # Pad with zeros if needed
-                    recalls = np.pad(recalls, (0, len(actual_labels) - len(recalls)), 'constant')
+                # Get recalls or create dummy values
+                if 'recall_per_class' in result:
+                    recalls = result['recall_per_class']
+                    if len(recalls) < len(actual_labels):
+                        # Pad with zeros if needed
+                        recalls = np.pad(recalls, (0, len(actual_labels) - len(recalls)), 'constant')
+                else:
+                    # Create dummy recalls
+                    recalls = np.zeros(len(actual_labels))
                 
                 offset = width * i
                 ax.bar(x + offset, recalls[:len(actual_labels)], width, label=model_name, alpha=0.8)
@@ -635,11 +760,11 @@ def create_all_visualizations(results, X_test_df, y_test, label_names):
         for name, result in results.items():
             summary_data.append([
                 name,
-                f"{result['accuracy']:.4f}",
-                f"{result['precision']:.4f}",
-                f"{result['recall']:.4f}",
-                f"{result['f1_score']:.4f}",
-                f"{result['cv_mean']:.4f} ±{result['cv_std']:.4f}"
+                f"{result.get('accuracy', 0):.4f}",
+                f"{result.get('precision', 0):.4f}",
+                f"{result.get('recall', 0):.4f}",
+                f"{result.get('f1_score', 0):.4f}",
+                f"{result.get('cv_mean', 0):.4f} ±{result.get('cv_std', 0):.4f}"
             ])
         
         # Create table
@@ -709,12 +834,12 @@ def save_all_models(results, scaler):
     
     for name, result in results.items():
         metadata['performance'][name] = {
-            'accuracy': float(result['accuracy']),
-            'precision': float(result['precision']),
-            'recall': float(result['recall']),
-            'f1_score': float(result['f1_score']),
-            'cv_mean': float(result['cv_mean']),
-            'cv_std': float(result['cv_std'])
+            'accuracy': float(result.get('accuracy', 0.0)),
+            'precision': float(result.get('precision', 0.0)),
+            'recall': float(result.get('recall', 0.0)),
+            'f1_score': float(result.get('f1_score', 0.0)),
+            'cv_mean': float(result.get('cv_mean', 0.0)),
+            'cv_std': float(result.get('cv_std', 0.0))
         }
     
     metadata_path = os.path.join(MODELS_DIR, 'metadata.json')
@@ -737,34 +862,52 @@ def predict_new_data(models, scaler, temperature, humidity, hour=None, minute=No
     
     # Prepare features
     features = np.array([[temperature, humidity, hour, minute]])
-    features_scaled = scaler.transform(features)
+    
+    # Scale features if scaler is available
+    if scaler is not None:
+        features_scaled = scaler.transform(features)
+    else:
+        features_scaled = features
     
     predictions = {}
     
     for model_name, model_data in models.items():
+        if 'model' not in model_data:
+            print(f"⚠️  Model {model_name} not found in model_data")
+            continue
+            
         model = model_data['model']
         
         # Predict
-        prediction = model.predict(features_scaled)[0]
-        
-        # Get probabilities
-        if hasattr(model, 'predict_proba'):
-            probabilities = model.predict_proba(features_scaled)[0]
-            confidence = probabilities[prediction]
-        else:
-            confidence = 1.0
-            probabilities = [0, 0, 0]
-        
-        # Map to label
-        label_map = {0: 'DINGIN', 1: 'NORMAL', 2: 'PANAS'}
-        label = label_map.get(prediction, 'UNKNOWN')
-        
-        predictions[model_name] = {
-            'label': label,
-            'label_encoded': int(prediction),
-            'confidence': float(confidence),
-            'probabilities': probabilities.tolist() if hasattr(model, 'predict_proba') else None
-        }
+        try:
+            prediction = model.predict(features_scaled)[0]
+            
+            # Get probabilities
+            if hasattr(model, 'predict_proba'):
+                probabilities = model.predict_proba(features_scaled)[0]
+                confidence = probabilities[prediction]
+            else:
+                confidence = 1.0
+                probabilities = [0, 0, 0]
+            
+            # Map to label
+            label_map = {0: 'DINGIN', 1: 'NORMAL', 2: 'PANAS'}
+            label = label_map.get(prediction, 'UNKNOWN')
+            
+            predictions[model_name] = {
+                'label': label,
+                'label_encoded': int(prediction),
+                'confidence': float(confidence),
+                'probabilities': probabilities.tolist() if hasattr(model, 'predict_proba') else None
+            }
+        except Exception as e:
+            print(f"❌ Error predicting with {model_name}: {e}")
+            predictions[model_name] = {
+                'label': 'ERROR',
+                'label_encoded': -1,
+                'confidence': 0.0,
+                'probabilities': None
+            }
     
     return predictions
 
@@ -971,78 +1114,133 @@ def main():
     mqtt_manager.connect()
     
     try:
-        # 1. Load and prepare data
-        data_result = load_and_prepare_data()
-        if data_result is None:
-            print("❌ Failed to load data")
-            return
+        # ===== CEK APAKAH MODEL SUDAH ADA =====
+        print("\n🔍 CHECKING FOR EXISTING MODELS...")
+        existing, missing = check_if_models_exist()
         
-        X_train, X_test, y_train, y_test, scaler, df, X_test_df = data_result
+        if existing:
+            print(f"✅ Found {len(existing)} existing model files:")
+            for file in existing:
+                print(f"   • {file}")
         
-        # 2. Train models (will handle single class data)
-        results, label_names = train_all_models(X_train, X_test, y_train, y_test)
+        if missing:
+            print(f"⚠️  Missing {len(missing)} files:")
+            for file in missing:
+                print(f"   • {file}")
         
-        if not results:
-            print("❌ No models were successfully trained")
-            return
-        
-        # 3. Create visualizations
-        create_all_visualizations(results, X_test_df, y_test, label_names)
-        
-        # 4. Save all models
-        metadata = save_all_models(results, scaler)
-        
-        # 5. Test and publish to MQTT
-        test_and_publish_all_models(results, scaler, mqtt_manager)
-        
-        # 6. Show final summary
+        # ===== PILIH MODE =====
         print("\n" + "="*60)
-        print("🏆 TRAINING COMPLETE")
+        print("🎯 SELECT MODE:")
+        print("1. Train new models (will overwrite existing)")
+        print("2. Load existing models")
+        print("3. Skip training, just make predictions")
         print("="*60)
         
-        print(f"\n📊 Models trained and saved:")
-        for model_name in results.keys():
-            acc = results[model_name]['accuracy']
-            f1 = results[model_name]['f1_score']
-            print(f"   • {model_name:25} → Accuracy: {acc:.4f}, F1: {f1:.4f}")
+        choice = input("Enter choice (1/2/3): ").strip()
         
-        # Find best model by F1-score if we have at least 2 models
-        if len(results) >= 2:
-            best_model = max(results.items(), key=lambda x: x[1]['f1_score'])[0]
-            best_f1 = results[best_model]['f1_score']
-            print(f"\n🏆 Best Model: {best_model} (F1-Score: {best_f1:.4f})")
+        results = None
+        scaler = None
+        label_names = ['DINGIN', 'NORMAL', 'PANAS']
+        X_test_df = None
+        y_test = None
         
-        print(f"\n📁 Files saved:")
-        print(f"   • Models: {MODELS_DIR}/")
-        print(f"   • Reports: {REPORTS_DIR}/")
+        if choice == "1":
+            print("\n🔨 TRAINING NEW MODELS...")
+            # 1. Load and prepare data
+            data_result = load_and_prepare_data()
+            if data_result is None:
+                print("❌ Failed to load data")
+                return
+            
+            X_train, X_test, y_train, y_test, scaler, df, X_test_df = data_result
+            
+            # 2. Train models
+            results, label_names = train_all_models(X_train, X_test, y_train, y_test)
+            
+            if not results:
+                print("❌ No models were successfully trained")
+                return
+            
+            # 3. Create visualizations
+            create_all_visualizations(results, X_test_df, y_test, label_names)
+            
+            # 4. Save all models
+            metadata = save_all_models(results, scaler)
+            
+        elif choice == "2":
+            if existing:
+                print("\n📂 LOADING EXISTING MODELS...")
+                results, scaler = load_all_models()
+                
+                if results:
+                    print(f"✅ Loaded {len(results)} models")
+                    
+                    # Load test data for visualizations
+                    data_result = load_and_prepare_data()
+                    if data_result is not None:
+                        X_train, X_test, y_train, y_test, _, df, X_test_df = data_result
+                        
+                        # Update predictions for loaded models
+                        for name, result in results.items():
+                            if 'model' in result:
+                                model = result['model']
+                                if scaler is not None:
+                                    y_pred = model.predict(scaler.transform(X_test))
+                                else:
+                                    y_pred = model.predict(X_test)
+                                result['y_pred'] = y_pred
+                        
+                        create_all_visualizations(results, X_test_df, y_test, label_names)
+                else:
+                    print("❌ Failed to load any models")
+                    return
+            else:
+                print("❌ No existing models found. Please train models first.")
+                return
+                
+        elif choice == "3":
+            print("\n⚡ SKIPPING TRAINING, GOING TO PREDICTION...")
+            results, scaler = load_all_models()
+            if not results:
+                print("❌ No models found to make predictions")
+                return
+        else:
+            print("❌ Invalid choice. Exiting.")
+            return
         
-        print(f"\n📡 MQTT Configuration:")
-        print(f"   • Broker: {MQTT_BROKER}")
-        print(f"   • Topic (Receive): {SUB_TOPIC_DHT}")
-        print(f"   • Topic (Send): {PUB_TOPIC_PREDICTION}")
-        
-        print(f"\n🔧 How to use models:")
-        print(f"   1. Load models: pickle.load('model.pkl')")
-        print(f"   2. Load scaler: pickle.load('scaler.pkl')")
-        print(f"   3. Make predictions: model.predict(scaler.transform(features))")
-        print(f"   4. Check metadata.json for details")
-        
-        # Ask if want to run real-time mode
-        print("\n" + "="*60)
-        response = input("🎯 Run real-time prediction mode? (y/n): ").lower()
-        
-        if response == 'y':
-            real_time_prediction_mode(results, scaler, mqtt_manager)
-        
-        print("\n✅ All models ready for deployment!")
-        print("="*60)
-        
+        # ===== LANJUT KE PREDICTION =====
+        if results and scaler:
+            # 5. Test and publish to MQTT
+            test_and_publish_all_models(results, scaler, mqtt_manager)
+            
+            # Show final summary
+            print("\n" + "="*60)
+            print("🏆 SYSTEM READY")
+            print("="*60)
+            
+            print(f"\n📊 Available models:")
+            for model_name, result in results.items():
+                acc = result.get('accuracy', 0.0)
+                print(f"   • {model_name:25} → Accuracy: {acc:.4f}")
+            
+            # Ask if want to run real-time mode
+            print("\n" + "="*60)
+            response = input("🎯 Run real-time prediction mode? (y/n): ").lower()
+            
+            if response == 'y':
+                real_time_prediction_mode(results, scaler, mqtt_manager)
+            
+            print("\n✅ System ready for deployment!")
+            print("="*60)
+        else:
+            print("❌ No models available for prediction")
+            
     except Exception as e:
         print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        # Disconnect MQTT
+        # MQTT
         mqtt_manager.disconnect()
 
 if __name__ == "__main__":
