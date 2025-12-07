@@ -4,6 +4,7 @@ numpy
 plotly
 paho-mqtt
 scikit-learn
-pickle5
+statsmodels
 jsonschema
+
 
