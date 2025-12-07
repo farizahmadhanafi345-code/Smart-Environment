@@ -1,6 +1,6 @@
 """
-DHT11 REAL-TIME DASHBOARD WITH HIVEMQ
-Streamlit Dashboard untuk monitoring real-time sensor DHT11 dengan ML predictions
+DASHBOARD DHT11 REAL-TIME dengan Download CSV
+Fixed version - tanpa statsmodels dependency
 """
 
 import streamlit as st
@@ -9,20 +9,15 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
-import json
 import pickle
 import os
 import time
-import paho.mqtt.client as mqtt
-import threading
-import queue
+import json
 import warnings
-from pathlib import Path
 
 # ==================== CONFIGURATION ====================
 warnings.filterwarnings('ignore')
 
-# Page configuration
 st.set_page_config(
     page_title="DHT11 Real-Time Dashboard",
     page_icon="🌡️",
@@ -30,246 +25,200 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ==================== PATH SETUP ====================
-# Gunakan path yang sama dengan training
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR_OPTIONS = [
-    r"C:\Users\USER\OneDrive\Documents\broker\dashboardstreamlit",
-    SCRIPT_DIR
-]
-
-BASE_DIR = None
-for base_dir in BASE_DIR_OPTIONS:
-    if os.path.exists(base_dir):
-        BASE_DIR = base_dir
-        break
-
-if BASE_DIR is None:
-    BASE_DIR = SCRIPT_DIR
-
-# Path untuk Trainingdht (sama dengan training)
-TRAININGDHT_DIR = os.path.join(BASE_DIR, "Trainingdht")
-CSV_FILE = os.path.join(TRAININGDHT_DIR, "sensor_data.csv")
-MODELS_DIR = os.path.join(TRAININGDHT_DIR, "models")
-REPORTS_DIR = os.path.join(TRAININGDHT_DIR, "reports")
-CSV_PKL_DIR = os.path.join(TRAININGDHT_DIR, "csv_pkl")
-
-# Buat folder jika belum ada
-os.makedirs(TRAININGDHT_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True)
-os.makedirs(REPORTS_DIR, exist_ok=True)
-os.makedirs(CSV_PKL_DIR, exist_ok=True)
-
 # ==================== HIVEMQ CONFIGURATION ====================
 MQTT_BROKER = "76c4ab43d10547d5a223d4648d43ceb6.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 MQTT_USERNAME = "hivemq.webclient.1764923408610"
 MQTT_PASSWORD = "9y&f74G1*pWSD.tQdXa@"
 DHT_TOPIC = "sic/dibimbing/kelompok-SENSOR/FARIZ/pub/dht"
-PREDICTION_TOPIC = "sic/dibimbing/kelompok-SENSOR/FARIZ/pub/ml_prediction"
 
-# ==================== HIVEMQ MANAGER ====================
-class HiveMQManager:
-    """Manage real-time HiveMQ connection"""
-    
-    def __init__(self):
-        self.client = None
-        self.connected = False
-        self.message_queue = queue.Queue(maxsize=100)
-        self.received_data = []
-        self.max_history = 500
-        self.status = "Disconnected"
-        self.last_message_time = None
-        
-    def connect(self):
-        """Connect to HiveMQ broker"""
-        try:
-            self.client = mqtt.Client()
-            self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-            self.client.tls_set()
-            
-            # Set callbacks
-            self.client.on_connect = self._on_connect
-            self.client.on_message = self._on_message
-            self.client.on_disconnect = self._on_disconnect
-            
-            # Connect
-            self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            self.client.loop_start()
-            
-            time.sleep(2)
-            return True
-            
-        except Exception as e:
-            self.status = f"Connection error: {str(e)[:50]}"
-            return False
-    
-    def _on_connect(self, client, userdata, flags, rc):
-        """Callback for successful connection"""
-        if rc == 0:
-            self.connected = True
-            self.status = "Connected"
-            client.subscribe(DHT_TOPIC)
-            client.subscribe(PREDICTION_TOPIC)
-            print(f"✅ Connected to HiveMQ and subscribed to topics")
-        else:
-            self.connected = False
-            self.status = f"Connection failed (code: {rc})"
-    
-    def _on_message(self, client, userdata, msg):
-        """Callback for received messages"""
-        try:
-            data = json.loads(msg.payload.decode())
-            data['topic'] = msg.topic
-            data['received_time'] = datetime.now().strftime('%H:%M:%S')
-            data['timestamp'] = datetime.now().isoformat()
-            data['message_type'] = 'sensor' if msg.topic == DHT_TOPIC else 'prediction'
-            
-            # Add to queue
-            self.message_queue.put(data)
-            
-            # Store in history
-            self.received_data.append(data)
-            if len(self.received_data) > self.max_history:
-                self.received_data = self.received_data[-self.max_history:]
-            
-            self.last_message_time = datetime.now()
-            
-        except Exception as e:
-            print(f"Error processing MQTT message: {e}")
-    
-    def _on_disconnect(self, client, userdata, rc):
-        """Callback for disconnection"""
-        self.connected = False
-        self.status = "Disconnected"
-    
-    def get_latest_message(self):
-        """Get latest message from queue"""
-        try:
-            return self.message_queue.get_nowait()
-        except queue.Empty:
-            return None
-    
-    def get_all_messages(self):
-        """Get all received messages"""
-        return self.received_data.copy()
-    
-    def get_sensor_messages(self):
-        """Get only sensor messages"""
-        return [m for m in self.received_data if m.get('topic') == DHT_TOPIC]
-    
-    def get_prediction_messages(self):
-        """Get only prediction messages"""
-        return [m for m in self.received_data if m.get('topic') == PREDICTION_TOPIC]
-    
-    def publish_prediction(self, prediction_data):
-        """Publish prediction to HiveMQ"""
-        if self.connected and self.client:
-            try:
-                payload = json.dumps(prediction_data)
-                result = self.client.publish(PREDICTION_TOPIC, payload, qos=1)
-                return result.rc == mqtt.MQTT_ERR_SUCCESS
-            except Exception as e:
-                print(f"Publish error: {e}")
-                return False
-        return False
-    
-    def disconnect(self):
-        """Disconnect from HiveMQ"""
-        if self.client and self.connected:
-            self.client.loop_stop()
-            self.client.disconnect()
-            self.connected = False
-            self.status = "Manually disconnected"
+# ==================== PATH CONFIGURATION ====================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TRAININGDHT_DIR = os.path.join(BASE_DIR, "Trainingdht")
+MODELS_DIR = os.path.join(TRAININGDHT_DIR, "models")
+CSV_PKL_DIR = os.path.join(TRAININGDHT_DIR, "csv_pkl")
+CSV_FILE = os.path.join(TRAININGDHT_DIR, "sensor_data.csv")
 
-# ==================== LOAD MODELS FROM TRAINING ====================
-@st.cache_resource
-def load_trained_models():
-    """Load trained models and scaler from training directory"""
+# Buat folder jika belum ada
+os.makedirs(TRAININGDHT_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(CSV_PKL_DIR, exist_ok=True)
+
+# ==================== DATA MANAGEMENT FUNCTIONS ====================
+def load_csv_data():
+    """Load data dari CSV file"""
     try:
-        models = {}
-        
-        # Load scaler
-        scaler_path = os.path.join(MODELS_DIR, "scaler.pkl")
-        if os.path.exists(scaler_path):
-            with open(scaler_path, 'rb') as f:
-                scaler = pickle.load(f)
+        if os.path.exists(CSV_FILE):
+            df = pd.read_csv(CSV_FILE, delimiter=';')
+            return df
         else:
-            # Fallback to CSV_PKL scaler
-            scaler_csv_pkl = os.path.join(CSV_PKL_DIR, "scaler.csv.pkl")
-            if os.path.exists(scaler_csv_pkl):
-                with open(scaler_csv_pkl, 'rb') as f:
-                    scaler_info = pickle.load(f)
-                    from sklearn.preprocessing import StandardScaler
-                    scaler = StandardScaler()
-                    if isinstance(scaler_info, pd.DataFrame):
-                        scaler.mean_ = scaler_info['mean'].values
-                        scaler.scale_ = scaler_info['scale'].values
-            else:
-                from sklearn.preprocessing import StandardScaler
-                scaler = StandardScaler()
+            return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Error loading CSV: {e}")
+        return pd.DataFrame()
+
+def save_to_csv(data_dict):
+    """Save data ke CSV file"""
+    try:
+        timestamp = datetime.now().strftime('%H;%M;%S')
+        date_str = datetime.now().strftime('%Y-%m-%d')
         
-        # Load models from models directory
-        model_files = {
-            'Decision Tree': 'decision_tree.pkl',
-            'K-Nearest Neighbors': 'k_nearest_neighbors.pkl',
-            'Logistic Regression': 'logistic_regression.pkl'
+        new_row = {
+            'timestamp': timestamp,
+            'temperature': data_dict.get('temperature', 0),
+            'humidity': data_dict.get('humidity', 0),
+            'label': data_dict.get('label', ''),
+            'date': date_str
         }
         
-        for model_name, filename in model_files.items():
-            model_path = os.path.join(MODELS_DIR, filename)
-            if os.path.exists(model_path):
-                with open(model_path, 'rb') as f:
-                    models[model_name] = pickle.load(f)
-            else:
-                # Try CSV_PKL format
-                csv_pkl_path = os.path.join(CSV_PKL_DIR, filename.replace('.pkl', '.csv.pkl'))
-                if os.path.exists(csv_pkl_path):
-                    with open(csv_pkl_path, 'rb') as f:
-                        model_data = pickle.load(f)
-                        if isinstance(model_data, dict) and 'model' in model_data:
-                            models[model_name] = model_data['model']
+        df_new = pd.DataFrame([new_row])
         
+        if os.path.exists(CSV_FILE):
+            df_existing = pd.read_csv(CSV_FILE, delimiter=';')
+            df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+            df_combined.to_csv(CSV_FILE, sep=';', index=False)
+        else:
+            df_new.to_csv(CSV_FILE, sep=';', index=False)
+            
+        return True
+    except Exception as e:
+        st.error(f"Error saving to CSV: {e}")
+        return False
+
+# ==================== LOAD MODELS dari CSV.PKL ====================
+@st.cache_resource
+def load_models_from_csv_pkl():
+    """Load models dari folder CSV.PKL"""
+    models = {}
+    scaler = None
+    
+    try:
+        # 1. Load scaler dari CSV.PKL
+        scaler_csv_pkl = os.path.join(CSV_PKL_DIR, 'scaler.csv.pkl')
+        if os.path.exists(scaler_csv_pkl):
+            with open(scaler_csv_pkl, 'rb') as f:
+                scaler_info = pickle.load(f)
+                
+                from sklearn.preprocessing import StandardScaler
+                scaler = StandardScaler()
+                if isinstance(scaler_info, pd.DataFrame):
+                    scaler.mean_ = scaler_info['mean'].values
+                    scaler.scale_ = scaler_info['scale'].values
+                elif isinstance(scaler_info, StandardScaler):
+                    scaler = scaler_info
+                    
+            st.success("✅ Loaded scaler from CSV.PKL")
+        
+        # 2. Load 3 ML models dari CSV.PKL
+        model_files = [
+            ('Decision Tree', 'decision_tree.csv.pkl'),
+            ('K-Nearest Neighbors', 'k_nearest_neighbors.csv.pkl'),
+            ('Logistic Regression', 'logistic_regression.csv.pkl')
+        ]
+        
+        for model_name, filename in model_files:
+            csv_pkl_path = os.path.join(CSV_PKL_DIR, filename)
+            
+            if os.path.exists(csv_pkl_path):
+                with open(csv_pkl_path, 'rb') as f:
+                    model_data = pickle.load(f)
+                    
+                    if isinstance(model_data, dict) and 'model' in model_data:
+                        models[model_name] = model_data['model']
+                    elif hasattr(model_data, 'predict'):
+                        models[model_name] = model_data
+        
+        # 3. Fallback: Load dari folder models
         if not models:
-            st.warning("No trained models found. Please run model_training.py first")
-            return None, None
+            model_files_pkl = {
+                'Decision Tree': 'decision_tree.pkl',
+                'K-Nearest Neighbors': 'k_nearest_neighbors.pkl',
+                'Logistic Regression': 'logistic_regression.pkl'
+            }
+            
+            for model_name, filename in model_files_pkl.items():
+                model_path = os.path.join(MODELS_DIR, filename)
+                if os.path.exists(model_path):
+                    with open(model_path, 'rb') as f:
+                        models[model_name] = pickle.load(f)
         
+        if models:
+            st.success(f"✅ Loaded {len(models)} ML models")
+        else:
+            st.error("❌ No models found!")
+            
         return models, scaler
         
     except Exception as e:
         st.error(f"Error loading models: {e}")
-        return None, None
+        return {}, None
 
-@st.cache_data
-def load_dataset():
-    """Load historical dataset"""
+# ==================== HIVEMQ SIMPLE CONNECTION ====================
+def connect_to_hivemq():
+    """Simple connection to HiveMQ untuk real-time data"""
     try:
-        if os.path.exists(CSV_FILE):
-            df = pd.read_csv(CSV_FILE, delimiter=';')
-            
-            if 'timestamp' in df.columns:
-                # Process timestamp
-                df[['hour', 'minute', 'second']] = df['timestamp'].str.split(';', expand=True).astype(int)
-            
-            return df
-        else:
-            return pd.DataFrame()
-    except:
-        return pd.DataFrame()
+        import paho.mqtt.client as mqtt
+        
+        client = mqtt.Client()
+        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        client.tls_set()
+        
+        received_messages = []
+        latest_data = None
+        
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                print("✅ Connected to HiveMQ")
+                client.subscribe(DHT_TOPIC)
+                print(f"📡 Subscribed to: {DHT_TOPIC}")
+        
+        def on_message(client, userdata, msg):
+            nonlocal latest_data, received_messages
+            try:
+                data = json.loads(msg.payload.decode())
+                data['received_time'] = datetime.now()
+                data['timestamp_str'] = datetime.now().strftime('%H:%M:%S')
+                
+                latest_data = data
+                received_messages.append(data)
+                
+                # Save to CSV
+                save_to_csv(data)
+                
+                # Keep only last 100 messages in memory
+                if len(received_messages) > 100:
+                    received_messages = received_messages[-100:]
+                    
+            except Exception as e:
+                print(f"Error processing message: {e}")
+        
+        client.on_connect = on_connect
+        client.on_message = on_message
+        
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.loop_start()
+        
+        time.sleep(2)
+        
+        return client, latest_data, received_messages
+        
+    except Exception as e:
+        st.error(f"⚠️ HiveMQ Connection Error: {e}")
+        return None, None, []
 
+# ==================== PREDICTION FUNCTIONS ====================
 def get_label_color(label):
-    """Get color based on label"""
     colors = {
-        'DINGIN': '#3498db',    # Blue
-        'NORMAL': '#2ecc71',    # Green
-        'PANAS': '#e74c3c',     # Red
-        'UNKNOWN': '#95a5a6',   # Gray
-        'ERROR': '#f39c12'      # Orange
+        'DINGIN': '#3498db',
+        'NORMAL': '#2ecc71',
+        'PANAS': '#e74c3c',
+        'UNKNOWN': '#95a5a6',
+        'ERROR': '#f39c12'
     }
     return colors.get(label, '#95a5a6')
 
 def predict_with_models(models, scaler, temperature, humidity, hour=None, minute=None):
-    """Make predictions using all trained models"""
+    """Predict dengan semua model dari CSV.PKL"""
     if hour is None or minute is None:
         now = datetime.now()
         hour = now.hour
@@ -277,23 +226,27 @@ def predict_with_models(models, scaler, temperature, humidity, hour=None, minute
     
     features = np.array([[temperature, humidity, hour, minute]])
     
-    try:
-        if hasattr(scaler, 'transform'):
-            features_scaled = scaler.transform(features)
-        else:
-            features_scaled = features
-    except:
-        features_scaled = features
-    
     predictions = {}
     
     for model_name, model in models.items():
         try:
+            if scaler is not None and hasattr(scaler, 'transform'):
+                try:
+                    features_scaled = scaler.transform(features)
+                except:
+                    features_scaled = features
+            else:
+                features_scaled = features
+            
             pred_code = model.predict(features_scaled)[0]
             
             if hasattr(model, 'predict_proba'):
-                probs = model.predict_proba(features_scaled)[0]
-                confidence = probs[pred_code] if len(probs) > pred_code else 1.0
+                try:
+                    probs = model.predict_proba(features_scaled)[0]
+                    confidence = probs[pred_code] if len(probs) > pred_code else 1.0
+                except:
+                    confidence = 1.0
+                    probs = [0, 0, 0]
             else:
                 confidence = 1.0
                 probs = [0, 0, 0]
@@ -309,8 +262,7 @@ def predict_with_models(models, scaler, temperature, humidity, hour=None, minute
                     'NORMAL': float(probs[1]) if len(probs) > 1 else 0,
                     'PANAS': float(probs[2]) if len(probs) > 2 else 0
                 },
-                'color': get_label_color(label),
-                'features': [temperature, humidity, hour, minute]
+                'color': get_label_color(label)
             }
             
         except Exception as e:
@@ -323,460 +275,370 @@ def predict_with_models(models, scaler, temperature, humidity, hour=None, minute
     
     return predictions
 
-# ==================== SIDEBAR CONTROLS ====================
-def render_sidebar(mqtt_manager, models):
-    """Render sidebar controls"""
-    st.sidebar.title("⚙️ Dashboard Controls")
-    
-    # HiveMQ Connection Status
-    st.sidebar.subheader("📡 HiveMQ Connection")
-    
-    if mqtt_manager.connected:
-        st.sidebar.success("✅ Connected")
-        if st.sidebar.button("Disconnect", key="disconnect_btn"):
-            mqtt_manager.disconnect()
-            st.rerun()
-    else:
-        st.sidebar.error("❌ Disconnected")
-        if st.sidebar.button("Connect", key="connect_btn"):
-            if mqtt_manager.connect():
-                st.rerun()
-    
-    # Model Selection
-    st.sidebar.subheader("🤖 Active Models")
-    
-    selected_models = {}
-    if models:
-        for model_name in models.keys():
-            selected_models[model_name] = st.sidebar.checkbox(
-                model_name, 
-                value=True, 
-                key=f"model_{model_name}"
-            )
-    
-    # Real-time Settings
-    st.sidebar.subheader("🌐 Real-time Settings")
-    
-    auto_refresh = st.sidebar.checkbox("Auto-refresh", value=True, key="auto_refresh")
-    if auto_refresh:
-        refresh_interval = st.sidebar.slider("Refresh (seconds)", 1, 10, 2, key="refresh_interval")
-    
-    # Manual Prediction
-    st.sidebar.subheader("🔮 Manual Prediction")
-    
-    manual_temp = st.sidebar.slider("Temperature (°C)", 15.0, 35.0, 24.0, 0.5, key="manual_temp")
-    manual_hum = st.sidebar.slider("Humidity (%)", 30.0, 90.0, 65.0, 1.0, key="manual_hum")
-    
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        manual_hour = st.sidebar.number_input("Hour", 0, 23, datetime.now().hour, key="manual_hour")
-    with col2:
-        manual_minute = st.sidebar.number_input("Minute", 0, 59, datetime.now().minute, key="manual_minute")
-    
-    # Data Management
-    st.sidebar.subheader("📊 Data")
-    
-    if st.sidebar.button("Clear Messages", key="clear_msg"):
-        mqtt_manager.received_data = []
-        st.rerun()
-    
-    if st.sidebar.button("Save to CSV", key="save_csv"):
-        messages = mqtt_manager.get_sensor_messages()
-        if messages:
-            new_data = pd.DataFrame(messages)
-            if os.path.exists(CSV_FILE):
-                existing_data = pd.read_csv(CSV_FILE, delimiter=';')
-                combined_data = pd.concat([existing_data, new_data], ignore_index=True)
-                combined_data.to_csv(CSV_FILE, sep=';', index=False)
-            else:
-                new_data.to_csv(CSV_FILE, sep=';', index=False)
-            st.sidebar.success(f"Saved {len(messages)} messages")
-    
-    # System Info
-    st.sidebar.subheader("📈 System Info")
-    
-    df = load_dataset()
-    if not df.empty:
-        st.sidebar.metric("Dataset Records", len(df))
-    
-    if models:
-        st.sidebar.metric("Loaded Models", len(models))
-    
-    return {
-        'selected_models': selected_models,
-        'manual_input': (manual_temp, manual_hum, manual_hour, manual_minute),
-        'auto_refresh': auto_refresh,
-        'refresh_interval': refresh_interval if 'refresh_interval' in locals() else 2
-    }
-
 # ==================== MAIN DASHBOARD ====================
 def main():
     st.title("🌡️ DHT11 Real-Time Dashboard")
-    st.markdown("Live monitoring of temperature/humidity with ML predictions via HiveMQ")
+    st.markdown("**Live sensor data • ML Predictions • CSV Download**")
     
-    # Initialize components
-    if 'mqtt_manager' not in st.session_state:
-        st.session_state.mqtt_manager = HiveMQManager()
-    
+    # Initialize session state
     if 'last_refresh' not in st.session_state:
         st.session_state.last_refresh = datetime.now()
+    if 'csv_data' not in st.session_state:
+        st.session_state.csv_data = load_csv_data()
     
-    mqtt_manager = st.session_state.mqtt_manager
+    # ===== SIDEBAR =====
+    with st.sidebar:
+        st.title("⚙️ Controls")
+        
+        # Load ML Models
+        st.subheader("🤖 ML Models")
+        if st.button("🔄 Load Models", use_container_width=True):
+            st.cache_resource.clear()
+            st.rerun()
+        
+        # Model Selection
+        show_dt = st.checkbox("Decision Tree", value=True, key="show_dt")
+        show_knn = st.checkbox("K-Nearest Neighbors", value=True, key="show_knn")
+        show_lr = st.checkbox("Logistic Regression", value=True, key="show_lr")
+        
+        # HiveMQ Connection
+        st.subheader("📡 HiveMQ")
+        use_hivemq = st.checkbox("Enable HiveMQ", value=True, key="use_hivemq")
+        
+        # Display Settings
+        st.subheader("📊 Display")
+        auto_refresh = st.checkbox("Auto Refresh", value=True, key="auto_refresh")
+        refresh_rate = st.slider("Refresh (seconds)", 1, 10, 3)
+        
+        # CSV Data Management
+        st.subheader("📁 CSV Data")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📥 Load CSV", use_container_width=True):
+                st.session_state.csv_data = load_csv_data()
+                st.success(f"Loaded {len(st.session_state.csv_data)} records")
+        
+        with col2:
+            if st.button("🗑️ Clear CSV", use_container_width=True):
+                if os.path.exists(CSV_FILE):
+                    os.remove(CSV_FILE)
+                    st.session_state.csv_data = pd.DataFrame()
+                    st.success("CSV cleared")
+        
+        # System Info
+        st.subheader("📈 System Info")
+        st.write(f"CSV Records: {len(st.session_state.csv_data)}")
+        st.write(f"Last: {st.session_state.last_refresh.strftime('%H:%M:%S')}")
     
-    # Load trained models
-    models, scaler = load_trained_models()
+    # Load ML Models
+    all_models, scaler = load_models_from_csv_pkl()
     
-    if models is None or scaler is None:
-        st.error("❌ Failed to load ML models. Please run model_training.py first.")
-        return
-    
-    # Render sidebar and get controls
-    controls = render_sidebar(mqtt_manager, models)
-    selected_models = controls['selected_models']
-    manual_input = controls['manual_input']
-    auto_refresh = controls['auto_refresh']
+    if not all_models:
+        st.error("❌ No ML models found. Please run training first.")
+        st.stop()
     
     # Filter active models
-    active_models = {name: model for name, model in models.items() 
-                     if selected_models.get(name, True)}
+    selected_models = {
+        'Decision Tree': show_dt,
+        'K-Nearest Neighbors': show_knn,
+        'Logistic Regression': show_lr
+    }
     
-    # ===== ROW 1: REAL-TIME METRICS =====
+    active_models = {name: model for name, model in all_models.items() 
+                    if selected_models.get(name, True)}
+    
+    # ===== REAL-TIME DATA SECTION =====
     st.markdown("---")
+    st.subheader("📡 REAL-TIME SENSOR DATA")
     
-    # Get latest sensor data
-    messages = mqtt_manager.get_sensor_messages()
-    latest_sensor = messages[-1] if messages else None
+    # Initialize HiveMQ
+    hivemq_client = None
+    latest_data = None
+    messages_history = []
     
-    col1, col2, col3, col4 = st.columns(4)
+    if use_hivemq:
+        try:
+            hivemq_client, latest_data, messages_history = connect_to_hivemq()
+            
+            if hivemq_client:
+                st.success("✅ Connected to HiveMQ")
+            else:
+                st.warning("⚠️ Could not connect to HiveMQ")
+                use_hivemq = False
+        except Exception as e:
+            st.warning(f"⚠️ HiveMQ Error: {e}")
+            use_hivemq = False
+    
+    # Display metrics
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
-        if latest_sensor:
-            temp = latest_sensor.get('temperature', 0)
-            st.metric("🌡️ Live Temperature", f"{temp}°C", 
-                     delta="Live" if mqtt_manager.connected else "Offline")
+        if latest_data and 'temperature' in latest_data:
+            temp = latest_data['temperature']
+            st.metric("🌡️ Temperature", f"{temp}°C", delta="LIVE")
         else:
-            st.metric("🌡️ Temperature", f"{manual_input[0]}°C", "Manual")
+            temp = 24.0
+            st.metric("🌡️ Temperature", f"{temp}°C", delta="MANUAL")
     
     with col2:
-        if latest_sensor:
-            hum = latest_sensor.get('humidity', 0)
-            st.metric("💧 Live Humidity", f"{hum}%", 
-                     delta="Live" if mqtt_manager.connected else "Offline")
+        if latest_data and 'humidity' in latest_data:
+            hum = latest_data['humidity']
+            st.metric("💧 Humidity", f"{hum}%", delta="LIVE")
         else:
-            st.metric("💧 Humidity", f"{manual_input[1]}%", "Manual")
+            hum = 65.0
+            st.metric("💧 Humidity", f"{hum}%", delta="MANUAL")
     
     with col3:
-        msg_count = len(messages)
-        st.metric("📥 Messages", msg_count, 
-                 delta=f"+{len(mqtt_manager.get_all_messages()) - msg_count}" if mqtt_manager.get_prediction_messages() else None)
+        data_count = len(messages_history) if messages_history else 0
+        st.metric("📊 Live Points", data_count)
     
     with col4:
-        status_color = "🟢" if mqtt_manager.connected else "🔴"
-        status_text = "Connected" if mqtt_manager.connected else "Disconnected"
-        st.metric("📡 HiveMQ", status_text, status_color)
+        csv_count = len(st.session_state.csv_data)
+        st.metric("📁 CSV Records", csv_count)
     
-    # ===== ROW 2: REAL-TIME PREDICTIONS =====
+    with col5:
+        status = "🟢 LIVE" if hivemq_client else "🔴 OFFLINE"
+        st.metric("📡 Status", status)
+    
+    # ===== ML PREDICTIONS SECTION =====
     st.markdown("---")
-    st.subheader("🔮 Real-time Predictions")
+    st.subheader("🤖 ML PREDICTIONS")
     
-    # Use live data if available, otherwise use manual input
-    if latest_sensor and mqtt_manager.connected:
-        temp = latest_sensor.get('temperature', manual_input[0])
-        hum = latest_sensor.get('humidity', manual_input[1])
-        hour = datetime.now().hour
-        minute = datetime.now().minute
-        source = "Live Sensor"
+    # Use latest data or manual
+    if latest_data:
+        temp = latest_data.get('temperature', 24.0)
+        hum = latest_data.get('humidity', 65.0)
+        data_source = "HiveMQ LIVE"
     else:
-        temp, hum, hour, minute = manual_input
-        source = "Manual Input"
+        # Manual input fallback
+        col1, col2 = st.columns(2)
+        with col1:
+            temp = st.number_input("Temperature (°C)", 15.0, 35.0, 24.0, 0.5, key="manual_temp")
+        with col2:
+            hum = st.number_input("Humidity (%)", 30.0, 90.0, 65.0, 1.0, key="manual_hum")
+        data_source = "MANUAL INPUT"
+    
+    hour = datetime.now().hour
+    minute = datetime.now().minute
     
     # Make predictions
     predictions = predict_with_models(active_models, scaler, temp, hum, hour, minute)
     
     # Display predictions
-    cols = st.columns(min(3, len(predictions)))
-    
-    for idx, (model_name, pred) in enumerate(predictions.items()):
-        if idx >= len(cols):
-            break
-            
-        with cols[idx]:
-            color = pred['color']
-            
-            # Prediction card
-            st.markdown(f"""
-            <div style="
-                background: linear-gradient(135deg, {color}15, {color}05);
-                border-radius: 10px;
-                padding: 15px;
-                border-left: 5px solid {color};
-                margin-bottom: 15px;
-                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-            ">
-                <h4 style="margin: 0; color: #333; font-size: 14px;">
-                    {model_name} <span style="font-size: 10px; color: #666;">({source})</span>
-                </h4>
-                <h2 style="margin: 10px 0; color: {color}; font-size: 24px;">
-                    {pred['label']}
-                </h2>
-                <p style="margin: 5px 0; font-size: 12px;">
-                    Confidence: <strong>{pred['confidence']:.1%}</strong>
-                </p>
-                <p style="margin: 5px 0; font-size: 11px; color: #666;">
-                    Temp: {temp}°C | Hum: {hum}%
-                </p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Probability chart
-            if 'probabilities' in pred:
-                prob_data = pd.DataFrame({
-                    'Class': ['DINGIN', 'NORMAL', 'PANAS'],
-                    'Probability': [
-                        pred['probabilities']['DINGIN'],
-                        pred['probabilities']['NORMAL'], 
-                        pred['probabilities']['PANAS']
-                    ]
-                })
-                
-                fig = px.bar(
-                    prob_data,
-                    x='Class',
-                    y='Probability',
-                    color='Class',
-                    color_discrete_map={
-                        'DINGIN': '#3498db',
-                        'NORMAL': '#2ecc71',
-                        'PANAS': '#e74c3c'
-                    },
-                    range_y=[0, 1]
-                )
-                fig.update_layout(
-                    showlegend=False,
-                    height=180,
-                    margin=dict(t=10, b=10, l=10, r=10),
-                    yaxis=dict(tickformat=".0%")
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            
-            # Publish button
-            if mqtt_manager.connected:
-                if st.button(f"📤 Publish", key=f"pub_{model_name}", use_container_width=True):
-                    prediction_data = {
-                        'model': model_name,
-                        'label': pred['label'],
-                        'confidence': pred['confidence'],
-                        'temperature': temp,
-                        'humidity': hum,
-                        'hour': hour,
-                        'minute': minute,
-                        'timestamp': datetime.now().isoformat(),
-                        'source': 'dashboard'
-                    }
-                    
-                    if mqtt_manager.publish_prediction(prediction_data):
-                        st.success(f"✅ Published {model_name} prediction!")
-                        time.sleep(0.5)
-                        st.rerun()
-    
-    # ===== ROW 3: REAL-TIME DATA STREAM =====
-    st.markdown("---")
-    st.subheader("📡 Live Data Stream")
-    
-    if mqtt_manager.connected:
-        tab1, tab2, tab3 = st.tabs(["📊 Sensor Data", "🤖 Predictions", "📈 Charts"])
+    if predictions:
+        cols = st.columns(min(3, len(predictions)))
         
-        with tab1:
-            # Display recent sensor data
-            sensor_messages = mqtt_manager.get_sensor_messages()[-20:]  # Last 20 messages
-            
-            if sensor_messages:
-                sensor_df = pd.DataFrame(sensor_messages)
-                st.dataframe(
-                    sensor_df[['received_time', 'temperature', 'humidity']].tail(10),
-                    use_container_width=True,
-                    height=300
-                )
+        for idx, (model_name, pred) in enumerate(predictions.items()):
+            if idx >= len(cols):
+                break
                 
-                # Line chart for temperature
-                if len(sensor_df) > 1:
-                    sensor_df['time'] = pd.to_datetime(sensor_df['received_time'], format='%H:%M:%S', errors='coerce')
-                    sensor_df = sensor_df.sort_values('time')
-                    
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=sensor_df['time'],
-                        y=sensor_df['temperature'],
-                        mode='lines+markers',
-                        name='Temperature',
-                        line=dict(color='#e74c3c', width=2)
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=sensor_df['time'],
-                        y=sensor_df['humidity'],
-                        name='Humidity',
-                        line=dict(color='#3498db', width=2),
-                        yaxis='y2'
-                    ))
-                    
-                    fig.update_layout(
-                        title='Real-time Sensor Data',
-                        yaxis=dict(title='Temperature (°C)', side='left'),
-                        yaxis2=dict(title='Humidity (%)', overlaying='y', side='right'),
-                        height=300,
-                        showlegend=True,
-                        xaxis_title='Time'
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Waiting for sensor data...")
-        
-        with tab2:
-            # Display prediction history
-            pred_messages = mqtt_manager.get_prediction_messages()[-10:]
-            
-            if pred_messages:
-                pred_df = pd.DataFrame(pred_messages)
-                st.dataframe(
-                    pred_df[['received_time', 'model', 'label', 'confidence']].tail(10),
-                    use_container_width=True,
-                    height=300
-                )
+            with cols[idx]:
+                color = pred['color']
                 
-                # Prediction accuracy over time
-                if len(pred_df) > 1:
-                    pred_counts = pred_df['label'].value_counts()
+                # Prediction card
+                st.markdown(f"""
+                <div style="
+                    background: linear-gradient(135deg, {color}15, white);
+                    border-radius: 12px;
+                    padding: 20px;
+                    border: 2px solid {color};
+                    margin-bottom: 15px;
+                    text-align: center;
+                ">
+                    <h3 style="color: #333; margin: 0 0 10px 0;">
+                        {model_name}
+                    </h3>
+                    <h1 style="color: {color}; margin: 15px 0; font-size: 28px;">
+                        {pred['label']}
+                    </h1>
+                    <div style="background: {color}20; padding: 8px 15px; border-radius: 20px;">
+                        <span style="color: #333; font-weight: bold;">
+                            {pred['confidence']:.1%} confidence
+                        </span>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Probability bars
+                if 'probabilities' in pred:
+                    prob_df = pd.DataFrame({
+                        'Label': ['DINGIN', 'NORMAL', 'PANAS'],
+                        'Probability': [
+                            pred['probabilities']['DINGIN'],
+                            pred['probabilities']['NORMAL'],
+                            pred['probabilities']['PANAS']
+                        ]
+                    })
                     
-                    fig = px.pie(
-                        values=pred_counts.values,
-                        names=pred_counts.index,
-                        color=pred_counts.index,
+                    fig = px.bar(
+                        prob_df,
+                        x='Label',
+                        y='Probability',
+                        color='Label',
                         color_discrete_map={
                             'DINGIN': '#3498db',
                             'NORMAL': '#2ecc71',
                             'PANAS': '#e74c3c'
                         },
-                        title='Prediction Distribution'
+                        range_y=[0, 1]
                     )
-                    st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No predictions published yet")
-        
-        with tab3:
-            # Combined charts
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Temperature distribution
-                if messages:
-                    temp_values = [m.get('temperature', 0) for m in messages if 'temperature' in m]
-                    if temp_values:
-                        fig = px.histogram(
-                            x=temp_values,
-                            title='Temperature Distribution',
-                            labels={'x': 'Temperature (°C)'},
-                            color_discrete_sequence=['#e74c3c']
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                # Humidity distribution
-                if messages:
-                    hum_values = [m.get('humidity', 0) for m in messages if 'humidity' in m]
-                    if hum_values:
-                        fig = px.histogram(
-                            x=hum_values,
-                            title='Humidity Distribution',
-                            labels={'x': 'Humidity (%)'},
-                            color_discrete_sequence=['#3498db']
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.warning("⚠️ Connect to HiveMQ to see real-time data")
-    
-    # ===== ROW 4: MODEL PERFORMANCE & HISTORY =====
-    st.markdown("---")
-    st.subheader("📊 Model Performance & History")
-    
-    # Load historical data
-    df = load_dataset()
-    
-    if not df.empty:
-        tab1, tab2 = st.tabs(["📈 Data Analysis", "🤖 Model Info"])
-        
-        with tab1:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Scatter plot
-                if 'temperature' in df.columns and 'humidity' in df.columns:
-                    fig = px.scatter(
-                        df,
-                        x='temperature',
-                        y='humidity',
-                        color='label' if 'label' in df.columns else None,
-                        title="Historical Temperature vs Humidity",
-                        color_discrete_map={
-                            'DINGIN': '#3498db',
-                            'NORMAL': '#2ecc71',
-                            'PANAS': '#e74c3c'
-                        } if 'label' in df.columns else None
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-            
-            with col2:
-                # Hourly averages
-                if 'hour' in df.columns:
-                    hourly_avg = df.groupby('hour').agg({
-                        'temperature': 'mean',
-                        'humidity': 'mean'
-                    }).reset_index()
-                    
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=hourly_avg['hour'],
-                        y=hourly_avg['temperature'],
-                        name='Temperature',
-                        line=dict(color='#e74c3c')
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=hourly_avg['hour'],
-                        y=hourly_avg['humidity'],
-                        name='Humidity',
-                        line=dict(color='#3498db'),
-                        yaxis='y2'
-                    ))
-                    
                     fig.update_layout(
-                        title='Average by Hour of Day',
-                        xaxis_title='Hour',
-                        yaxis_title='Temperature (°C)',
-                        yaxis2=dict(title='Humidity (%)', overlaying='y', side='right'),
-                        height=400
+                        showlegend=False,
+                        height=180,
+                        margin=dict(t=0, b=0, l=0, r=0),
+                        yaxis=dict(tickformat=".0%")
                     )
                     st.plotly_chart(fig, use_container_width=True)
         
-        with tab2:
-            # Model information
-            st.markdown("**Loaded Models:**")
-            for model_name, model in models.items():
-                with st.expander(f"{model_name}"):
-                    st.write(f"Type: {type(model).__name__}")
-                    
-                    if hasattr(model, 'get_params'):
-                        params = model.get_params()
-                        st.write(f"Parameters: {len(params)}")
-                        
-                        # Show important parameters
-                        important_params = ['max_depth', 'n_neighbors', 'C', 'solver', 'criterion']
-                        for param in important_params:
-                            if param in params:
-                                st.write(f"- {param}: {params[param]}")
-                    
-                    # Show if model is active
-                    st.write(f"Status: {'✅ Active' if selected_models.get(model_name, True) else '❌ Inactive'}")
-    else:
-        st.info("No historical data available")
+        # Model agreement
+        labels = [p['label'] for p in predictions.values()]
+        if len(set(labels)) == 1:
+            st.success(f"✅ **ALL MODELS AGREE:** {labels[0]}")
+        else:
+            st.warning(f"⚠️ **MODELS DISAGREE:** {', '.join(set(labels))}")
+    
+    # ===== CSV DATA DOWNLOAD SECTION =====
+    st.markdown("---")
+    st.subheader("📁 CSV DATA MANAGEMENT")
+    
+    tab1, tab2, tab3 = st.tabs(["📥 Download", "📊 Preview", "📈 Visualization"])
+    
+    with tab1:
+        st.markdown("### Download CSV Data")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            # Download current CSV
+            if not st.session_state.csv_data.empty:
+                csv = st.session_state.csv_data.to_csv(index=False, sep=';')
+                st.download_button(
+                    label="📥 Download Current CSV",
+                    data=csv,
+                    file_name="dht11_current_data.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.info("No CSV data available")
+        
+        with col2:
+            # Download with timestamp
+            if not st.session_state.csv_data.empty:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                csv = st.session_state.csv_data.to_csv(index=False, sep=';')
+                st.download_button(
+                    label="📅 Download with Timestamp",
+                    data=csv,
+                    file_name=f"dht11_data_{timestamp}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+        
+        with col3:
+            # Download live data
+            if messages_history:
+                live_df = pd.DataFrame(messages_history)
+                csv = live_df.to_csv(index=False)
+                st.download_button(
+                    label="📡 Download Live Data",
+                    data=csv,
+                    file_name="dht11_live_data.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.info("No live data available")
+    
+    with tab2:
+        st.markdown("### CSV Data Preview")
+        
+        if not st.session_state.csv_data.empty:
+            st.dataframe(
+                st.session_state.csv_data,
+                use_container_width=True,
+                height=300
+            )
+            
+            # Show stats
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Records", len(st.session_state.csv_data))
+            with col2:
+                if 'temperature' in st.session_state.csv_data.columns:
+                    avg_temp = st.session_state.csv_data['temperature'].mean()
+                    st.metric("Avg Temp", f"{avg_temp:.1f}°C")
+            with col3:
+                if 'humidity' in st.session_state.csv_data.columns:
+                    avg_hum = st.session_state.csv_data['humidity'].mean()
+                    st.metric("Avg Hum", f"{avg_hum:.1f}%")
+        else:
+            st.info("No CSV data available")
+    
+    with tab3:
+        st.markdown("### Data Visualization")
+        
+        if not st.session_state.csv_data.empty and len(st.session_state.csv_data) > 1:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if 'temperature' in st.session_state.csv_data.columns:
+                    fig = px.histogram(
+                        st.session_state.csv_data,
+                        x='temperature',
+                        title='Temperature Distribution',
+                        color_discrete_sequence=['#e74c3c']
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                if 'humidity' in st.session_state.csv_data.columns:
+                    fig = px.histogram(
+                        st.session_state.csv_data,
+                        x='humidity',
+                        title='Humidity Distribution',
+                        color_discrete_sequence=['#3498db']
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            # Scatter plot WITHOUT trendline (remove statsmodels dependency)
+            if 'temperature' in st.session_state.csv_data.columns and 'humidity' in st.session_state.csv_data.columns:
+                fig = px.scatter(
+                    st.session_state.csv_data,
+                    x='temperature',
+                    y='humidity',
+                    title='Temperature vs Humidity'
+                    # REMOVED: trendline='ols' - cause of error
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Need more data for visualization")
+    
+    # ===== REAL-TIME CHARTS =====
+    if use_hivemq and messages_history and len(messages_history) > 1:
+        st.markdown("---")
+        st.subheader("📈 REAL-TIME CHARTS")
+        
+        df_history = pd.DataFrame(messages_history)
+        
+        if 'received_time' in df_history.columns and 'temperature' in df_history.columns:
+            # Temperature trend
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df_history['received_time'],
+                y=df_history['temperature'],
+                mode='lines+markers',
+                name='Temperature',
+                line=dict(color='#e74c3c', width=2)
+            ))
+            
+            fig.update_layout(
+                title='Live Temperature Trend',
+                height=300,
+                template='plotly_white'
+            )
+            st.plotly_chart(fig, use_container_width=True)
     
     # ===== FOOTER =====
     st.markdown("---")
@@ -784,43 +646,29 @@ def main():
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.markdown("**System Status**")
-        st.write(f"- HiveMQ: {'🟢 Connected' if mqtt_manager.connected else '🔴 Disconnected'}")
-        st.write(f"- Models: {len(active_models)} active")
-        st.write(f"- Messages: {len(mqtt_manager.get_all_messages())}")
+        st.markdown("**📊 System Summary**")
+        st.write(f"- Active Models: {len(active_models)}")
+        st.write(f"- CSV Records: {len(st.session_state.csv_data)}")
+        st.write(f"- Live Data: {len(messages_history)} points")
     
     with col2:
-        st.markdown("**HiveMQ Info**")
-        st.write(f"- Broker: `{MQTT_BROKER}`")
-        st.write(f"- Topic: `{DHT_TOPIC}`")
-        st.write(f"- Last: {mqtt_manager.last_message_time.strftime('%H:%M:%S') if mqtt_manager.last_message_time else 'Never'}")
+        st.markdown("**⚡ Quick Actions**")
+        if st.button("🔄 Refresh All", use_container_width=True):
+            st.session_state.last_refresh = datetime.now()
+            st.session_state.csv_data = load_csv_data()
+            st.rerun()
     
     with col3:
-        st.markdown("**Quick Actions**")
-        if st.button("🔄 Refresh Now", use_container_width=True):
-            st.rerun()
-        
-        if st.button("💾 Export Data", use_container_width=True):
-            messages = mqtt_manager.get_all_messages()
-            if messages:
-                df_export = pd.DataFrame(messages)
-                csv = df_export.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=csv,
-                    file_name=f"hivemq_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+        st.markdown("**📁 Export Options**")
+        if st.button("📊 Export Report", use_container_width=True):
+            st.info("Report generation feature coming soon!")
     
     # Auto-refresh
     if auto_refresh:
-        refresh_interval = controls.get('refresh_interval', 2)
         current_time = datetime.now()
-        
-        if (current_time - st.session_state.last_refresh).seconds >= refresh_interval:
+        if (current_time - st.session_state.last_refresh).seconds >= refresh_rate:
             st.session_state.last_refresh = current_time
-            time.sleep(0.1)  # Small delay to allow UI updates
+            time.sleep(0.1)
             st.rerun()
 
 if __name__ == "__main__":
